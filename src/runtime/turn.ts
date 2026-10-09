@@ -13,6 +13,7 @@ import { parseGaps, recordGaps, type GapDraft } from "../insights/gap-capture.js
 import { recordCost, type CostSource } from "../costs/ledger.js";
 import { normalizeReply, splitPlainText, typingDelayMs, type ReplyMessage } from "./output.js";
 import { buildSystemPrompt, contextBlock } from "./prompt.js";
+import { finishScenario, runScenario, SCENARIO_TOOL, scenarioTool, type ScenarioHit } from "./scenarios.js";
 import { builtinTools, formatResults, RefRegistry, REPLY_TOOL } from "./tools.js";
 
 /**
@@ -225,12 +226,14 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
 
     // 5. LLM + ferramentas
     tm = Date.now();
-    const tools = [...builtinTools(spec), ...integrationTools(spec)];
+    const sc = scenarioTool(spec);
+    const tools = [...builtinTools(spec), ...integrationTools(spec), ...(sc ? [sc] : [])];
     // O que as integrações precisam saber da conversa (MakeCRM, contato, resumo).
     const ictx = await integrationCtx(conv, spec);
     let reply: ReplyMessage[] | null = null;
     let silentReason: string | undefined;
     let handoff: string | undefined;
+    let scenario: ScenarioHit | undefined;
     let gaps: GapDraft[] = [];
     let rounds = 0;
     let usedModel = model;
@@ -307,6 +310,12 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
             result = "Transferência registrada. Agora avise o lead pela ferramenta responder.";
             break;
           }
+          case SCENARIO_TOOL: {
+            const r = await runScenario(spec, args, ictx);
+            scenario ??= r.hit;
+            result = r.result;
+            break;
+          }
           default:
             if (INTEGRATION_TOOL_NAMES.has(call.function.name)) {
               const r = await runIntegrationTool(call.function.name, args, ictx);
@@ -319,6 +328,12 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
     }
     timings.llm = Date.now() - tm;
     reply ??= [];
+    // Cenário com resposta combinada: a mensagem configurada (ou nenhuma) no lugar da do modelo.
+    if (scenario?.scenario.reply === "fixed") reply = splitPlainText(scenario.scenario.message, spec);
+    else if (scenario?.scenario.reply === "none") {
+      reply = [];
+      silentReason = `cenário: ${scenario.scenario.name}`;
+    }
 
     // O lead mandou mais enquanto o agente pensava: descarta esta resposta (fica
     // no rastro, com o custo) e a próxima vez responde a tudo de uma vez.
@@ -397,6 +412,8 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
         if (b) await handOffToHuman({ conversationId: conv.external_id, inboxId: b.inbox_id, reason: handoff });
       }
     }
+    // Depois do envio: desliga a IA na conversa (se o cenário pedir), nota privada e registro.
+    if (scenario) await finishScenario(scenario, ictx, turnId).catch((e) => log.warn({ err: String(e) }, "turn: cenário não concluído"));
     timings.send = Date.now() - tm;
     timings.total = Date.now() - t0;
 
@@ -413,6 +430,10 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
       if (handoff) {
         await tx`insert into public.messages (conversation_id, role, content, turn_id) values (${conv.id}, 'note', ${`Transferido para a equipe: ${handoff}`}, ${turnId})`;
       }
+      if (scenario) {
+        const note = `Cenário "${scenario.scenario.name}"${scenario.reason ? ` (${scenario.reason})` : ""}: ${scenario.done.join("; ") || "—"}`;
+        await tx`insert into public.messages (conversation_id, role, content, turn_id) values (${conv.id}, 'note', ${note.slice(0, 2000)}, ${turnId})`;
+      }
       await tx`update public.conversations set last_reply_at = now() where id = ${conv.id}`;
       await tx`
         insert into public.turns (id, conversation_id, agent_id, agent_version, simulation, status, input_message_ids, model, rounds,
@@ -420,7 +441,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
         values (${turnId}, ${conv.id}, ${conv.agent_id}, ${version}, ${conv.simulation}, ${status}, ${pending.map((m) => m.id)}::bigint[], ${usedModel}, ${rounds},
                 ${usage.tokensIn}, ${usage.tokensOut}, ${usage.tokensCached}, ${usage.costUsd}, ${tx.json(timings as never)},
                 ${tx.json(toolLog as never)}, ${tx.json(retrievedLog as never)},
-                ${tx.json({ messages: reply, silent_reason: silentReason ?? null, handoff: handoff ?? null, gaps, ...(interrupted ? { interrupted: true } : {}) } as never)},
+                ${tx.json({ messages: reply, silent_reason: silentReason ?? null, handoff: handoff ?? null, gaps, ...(scenario ? { scenario: { id: scenario.scenario.id, name: scenario.scenario.name, reason: scenario.reason, done: scenario.done } } : {}), ...(interrupted ? { interrupted: true } : {}) } as never)},
                 ${sendError ? `Envio parcial: ${sendError}`.slice(0, 2000) : null})`;
     });
 
@@ -433,12 +454,13 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
 
     // A régua de follow-up começa a contar a partir desta resposta (sem resposta ou passando para a equipe: não).
     const fu = spec.followup;
-    if (live && status === "done" && !handoff && fu?.enabled && fu.steps.length) {
+    const stopFollowup = !!scenario && (scenario.scenario.actions.stop_followup || scenario.scenario.actions.turn_off_ai);
+    if (live && status === "done" && !handoff && !stopFollowup && fu?.enabled && fu.steps.length) {
       await sql`
         update public.conversations set followup_step = 0, followup_state = 'active',
           followup_next_at = now() + make_interval(mins => ${fu.steps[0]!.after_minutes})
         where id = ${conv.id}`;
-    } else if (live && handoff) {
+    } else if (live && (handoff || stopFollowup)) {
       await sql`update public.conversations set followup_next_at = null, followup_state = 'idle' where id = ${conv.id}`;
     }
 

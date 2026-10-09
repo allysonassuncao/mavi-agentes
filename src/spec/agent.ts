@@ -36,6 +36,7 @@ export type { WeeklyHours as WeeklyHoursT } from "./weekly-hours.js";
 import { WeeklyHours } from "./weekly-hours.js";
 import { Integration } from "./integrations.js";
 import { Followup } from "./followup.js";
+import { Scenarios } from "./scenarios.js";
 
 export const Instructions = z
   .object({
@@ -152,6 +153,8 @@ export const AgentSpec = z
     handoff: Handoff.default(Handoff.parse({})),
     /** O que o agente pode fazer: Google Agenda, oportunidade e responsáveis no MakeCRM, aviso à equipe. */
     integrations: z.array(Integration).max(10).default([]),
+    /** Situações fora do roteiro com ações combinadas ("quando o lead pedir X, faça Y"). */
+    scenarios: Scenarios,
     /** Régua de follow-up quando o lead para de responder. */
     followup: Followup.nullable().default(null),
     tools: z.array(ToolRef).max(40).default([]),

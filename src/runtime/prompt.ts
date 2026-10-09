@@ -1,6 +1,6 @@
 import type { AgentSpec } from "../spec/agent.js";
 import type { WeeklyHours } from "../spec/weekly-hours.js";
-import { integrationsPrompt } from "../integrations/prompt.js";
+import { integrationsPrompt, scenarioPrompt } from "../integrations/prompt.js";
 
 const DAY_NAMES: [keyof WeeklyHours, string][] = [
   ["mon", "Segunda"],
@@ -93,6 +93,8 @@ export function buildSystemPrompt(spec: AgentSpec): string {
 
   const actions = integrationsPrompt(spec);
   if (actions) parts.push(actions);
+  const scenarios = scenarioPrompt(spec);
+  if (scenarios) parts.push(scenarios);
 
   if (spec.memory.contact_fields.length) {
     parts.push(

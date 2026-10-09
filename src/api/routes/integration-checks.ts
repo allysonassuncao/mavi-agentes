@@ -37,4 +37,21 @@ export async function integrationCheckRoutes(app: FastifyInstance) {
       order by f.created_at desc limit 20`;
     return { days, groups, recent };
   });
+
+  /** Cenários acionados nas conversas reais: quantos por cenário e os últimos. */
+  app.get("/v1/agents/:id/scenario-runs", async (req) => {
+    const a = await loadAgent(req, (req.params as { id: string }).id);
+    const days = Math.min(Math.max(Number((req.query as { days?: string }).days) || 30, 1), 180);
+    const groups = await db()`
+      select scenario_id, max(scenario_name) as scenario_name, count(*)::int as n, max(created_at) as last_at
+      from public.scenario_runs
+      where agent_id = ${a.id} and not simulation and created_at > now() - make_interval(days => ${days})
+      group by 1 order by count(*) desc`;
+    const recent = await db()`
+      select r.id, r.scenario_id, r.scenario_name, r.reason, r.actions, r.created_at, r.conversation_id, c.contact_name, c.phone
+      from public.scenario_runs r left join public.conversations c on c.id = r.conversation_id
+      where r.agent_id = ${a.id} and not r.simulation and r.created_at > now() - make_interval(days => ${days})
+      order by r.created_at desc limit 30`;
+    return { days, groups, recent };
+  });
 }

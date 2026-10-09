@@ -178,6 +178,12 @@ export async function simulateRoutes(app: FastifyInstance) {
         await tx`insert into public.messages (conversation_id, role, content) values (${cid}, 'note', ${`Memória do agente zerada por ${by}.`})`;
         return m!.n;
       });
+      // As travas de "já feito" (cenários, ações na oportunidade, mover): o lead recomeça do zero.
+      for (const prefix of ["sc", "da", "mv"]) {
+        const keys: string[] = [];
+        for await (const batch of redis().scanStream({ match: `${prefix}:${cid}:*`, count: 200 })) keys.push(...(batch as string[]));
+        if (keys.length) await redis().del(...keys);
+      }
       return { ok: true, removed_messages: removed };
     } finally {
       await redis().eval(RELEASE, 1, convLockKey(cid), token);

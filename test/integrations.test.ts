@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { freeSlots, parseWhen, spreadSlots, withinAllowed } from "../src/integrations/calendar.js";
 import { spLabel } from "../src/integrations/time.js";
-import { integrationTools } from "../src/integrations/index.js";
+import { emailList, emailTypos, integrationTools } from "../src/integrations/index.js";
 import { integrationsPrompt } from "../src/integrations/prompt.js";
 import { parseSpec } from "../src/spec/agent.js";
 
@@ -59,7 +59,10 @@ describe("integrações na especificação", () => {
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     const names = integrationTools(r.spec).map((t) => t.function.name);
-    expect(names).toEqual(["agenda_horarios_livres", "agenda_marcar", "agenda_remarcar", "agenda_cancelar", "mover_oportunidade", "trocar_responsavel", "avisar_equipe"]);
+    expect(names).toEqual([
+      "agenda_horarios_livres", "agenda_marcar", "agenda_remarcar", "agenda_cancelar", "agenda_convidar", "agenda_remover_convidado",
+      "mover_oportunidade", "trocar_responsavel", "avisar_equipe",
+    ]);
     const mv = integrationTools(r.spec).find((t) => t.function.name === "mover_oportunidade")!;
     expect(mv.function.description).toContain("qualificado: quando o lead informar orçamento");
     expect(integrationsPrompt(r.spec)).toContain("agenda_horarios_livres");
@@ -74,5 +77,27 @@ describe("integrações na especificação", () => {
     const r = parseSpec({ ...base, integrations: [{ ...integrations[0], enabled: false }] });
     if (!r.ok) throw new Error("spec");
     expect(integrationTools(r.spec)).toEqual([]);
+  });
+
+  it("ferramentas de convidados só com convidados extras liberados", () => {
+    const on = parseSpec({ ...base, integrations: [integrations[0]] });
+    const off = parseSpec({ ...base, integrations: [{ ...integrations[0], max_guests: 0 }] });
+    if (!on.ok || !off.ok) throw new Error("spec");
+    expect(on.spec.integrations[0]).toMatchObject({ max_guests: 3, guests_see_others: true });
+    const names = (s: typeof on.spec) => integrationTools(s).map((t) => t.function.name);
+    expect(names(on.spec)).toEqual(expect.arrayContaining(["agenda_convidar", "agenda_remover_convidado"]));
+    expect(names(off.spec)).not.toContain("agenda_convidar");
+    const marcar = integrationTools(on.spec).find((t) => t.function.name === "agenda_marcar")!;
+    expect(Object.keys((marcar.function.parameters as { properties: object }).properties)).toContain("convidados");
+  });
+});
+
+describe("convidados da reunião", () => {
+  it("e-mails: lista ou texto, minúsculos, sem repetir, separando os inválidos", () => {
+    expect(emailList(["Socio@Empresa.com", "socio@empresa.com", "x@y"])).toEqual({ valid: ["socio@empresa.com"], invalid: ["x@y"] });
+    expect(emailList("a@b.com, c@d.com.br; e@f.io")).toEqual({ valid: ["a@b.com", "c@d.com.br", "e@f.io"], invalid: [] });
+  });
+  it("erro de digitação comum no domínio", () => {
+    expect(emailTypos(["joao@gmial.com", "ana@empresa.com"])).toEqual(["joao@gmial.com (talvez joao@gmail.com)"]);
   });
 });

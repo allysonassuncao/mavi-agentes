@@ -38,6 +38,10 @@ export const GoogleCalendar = z
     meet_link: z.boolean().default(true),
     /** Põe na descrição o resumo da conversa e os dados do lead. */
     add_summary: z.boolean().default(true),
+    /** Quantos convidados além do lead o agente pode incluir (0 = nenhum). */
+    max_guests: z.number().int().min(0).max(10).default(3),
+    /** Os convidados veem os e-mails uns dos outros no convite. */
+    guests_see_others: z.boolean().default(true),
   })
   .strict();
 
@@ -97,11 +101,93 @@ export const TeamNotify = z
   })
   .strict();
 
-export const Integration = z.discriminatedUnion("type", [GoogleCalendar, MoveDeal, ChangeOwner, TeamNotify]);
+/**
+ * Quem fica com a atividade criada pelo agente: a pessoa de um papel da
+ * oportunidade (com quem assume quando o papel está vazio), uma pessoa fixa
+ * ou um rodízio entre pessoas.
+ */
+export const ActivityAssignee = z
+  .object({
+    mode: z.enum(["deal_role", "fixed", "round_robin"]).default("deal_role"),
+    role: z.enum(["owner", "sdr", "closer"]).default("owner"),
+    /** fixed: a pessoa; deal_role: quem assume se a oportunidade não tiver ninguém no papel. */
+    user_id: uuid.nullable().default(null),
+    users: z.array(RotationUser).max(30).default([]),
+  })
+  .strict()
+  .refine((a) => (a.mode === "fixed" ? !!a.user_id : a.mode === "round_robin" ? a.users.length > 0 : true), "Escolha a pessoa (fixa) ou quem entra no rodízio.");
+
+const Named = z.object({ id: uuid, name: z.string().trim().max(200).default("") }).strict();
+const guide = z.string().trim().max(1000).default("");
+
+/**
+ * Ações na oportunidade do MakeCRM, como na tela do MakeCRM (mesmo histórico,
+ * mesmos webhooks de automação): dar como perdido ou ganho, criar orçamento,
+ * registrar no histórico e criar atividade. Cada uma liga à parte.
+ */
+export const DealActions = z
+  .object({
+    type: z.literal("makecrm_deal_actions"),
+    enabled: z.boolean().default(true),
+    lost: z
+      .object({
+        enabled: z.boolean().default(false),
+        /** Quando dar como perdido (além do que os Cenários já fazem). */
+        when: guide,
+        /** Motivos de perda que o agente pode usar (os da empresa no MakeCRM). */
+        reasons: z.array(Named).max(50).default([]),
+        /** Como na tela: cancela as reuniões futuras e conclui as atividades em aberto. */
+        cancel_meetings: z.boolean().default(true),
+        complete_activities: z.boolean().default(true),
+      })
+      .strict()
+      .default({ enabled: false, when: "", reasons: [], cancel_meetings: true, complete_activities: true }),
+    won: z
+      .object({ enabled: z.boolean().default(false), when: guide })
+      .strict()
+      .default({ enabled: false, when: "" }),
+    quote: z
+      .object({
+        enabled: z.boolean().default(false),
+        when: guide,
+        /** Produtos do catálogo do MakeCRM que o agente pode orçar, com o desconto máximo sobre o preço cadastrado. */
+        products: z
+          .array(z.object({ product_id: uuid, name: z.string().trim().max(300).default(""), max_discount_pct: z.number().min(0).max(100).default(0) }).strict())
+          .max(50)
+          .default([]),
+      })
+      .strict()
+      .default({ enabled: false, when: "", products: [] }),
+    note: z
+      .object({ enabled: z.boolean().default(false), when: guide })
+      .strict()
+      .default({ enabled: false, when: "" }),
+    activity: z
+      .object({
+        enabled: z.boolean().default(false),
+        when: guide,
+        /** Tipos de atividade do MakeCRM que o agente pode criar. */
+        types: z.array(Named).max(20).default([]),
+        assignee: ActivityAssignee.default({ mode: "deal_role", role: "owner", user_id: null, users: [] }),
+        /** Prazo quando o lead não combinou um dia (horas a partir de agora). */
+        default_due_hours: z.number().int().min(0).max(720).default(24),
+      })
+      .strict()
+      .default({ enabled: false, when: "", types: [], assignee: { mode: "deal_role", role: "owner", user_id: null, users: [] }, default_due_hours: 24 }),
+  })
+  .strict()
+  .refine((d) => d.lost.enabled || d.won.enabled || d.quote.enabled || d.note.enabled || d.activity.enabled, "Ligue ao menos uma ação.")
+  .refine((d) => !d.lost.enabled || d.lost.reasons.length > 0, { message: "Escolha os motivos de perda que o agente pode usar.", path: ["lost", "reasons"] })
+  .refine((d) => !d.quote.enabled || d.quote.products.length > 0, { message: "Escolha os produtos que o agente pode orçar.", path: ["quote", "products"] })
+  .refine((d) => !d.activity.enabled || d.activity.types.length > 0, { message: "Escolha os tipos de atividade.", path: ["activity", "types"] });
+
+export const Integration = z.discriminatedUnion("type", [GoogleCalendar, MoveDeal, ChangeOwner, TeamNotify, DealActions]);
 export type Integration = z.infer<typeof Integration>;
 export type GoogleCalendarConfig = z.infer<typeof GoogleCalendar>;
 export type MoveDealConfig = z.infer<typeof MoveDeal>;
 export type ChangeOwnerConfig = z.infer<typeof ChangeOwner>;
 export type TeamNotifyConfig = z.infer<typeof TeamNotify>;
+export type DealActionsConfig = z.infer<typeof DealActions>;
+export type ActivityAssigneeT = z.infer<typeof ActivityAssignee>;
 export type RotationUserT = z.infer<typeof RotationUser>;
 export type RoleTargetT = z.infer<typeof RoleTarget>;

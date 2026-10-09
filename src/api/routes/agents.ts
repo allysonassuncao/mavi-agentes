@@ -261,6 +261,25 @@ export async function agentRoutes(app: FastifyInstance) {
     return { pipelines: pipelines.map((p) => ({ ...p, stages: stages.filter((s) => s.pipeline_id === p.id) })) };
   });
 
+  /** Motivos de perda, produtos, tipos de atividade e moedas (para as ações na oportunidade e os cenários). */
+  app.get("/v1/makecrm/companies/:companyId/deal-catalog", async (req) => {
+    const { companyId } = req.params as { companyId: string };
+    if (!canCompany(req, companyId)) throw new HttpError(403, "Sem acesso a esta empresa.");
+    const enc = encodeURIComponent(companyId);
+    const [reasons, products, types, currencies] = await Promise.all([
+      rest<{ id: string; name: string }[]>(`lost_reasons?select=id,name&company_id=eq.${enc}&status=eq.true&order=name.asc`),
+      rest<{ id: string; name: string; price: number | null; currency: number | null }[]>(`products?select=id,name,price,currency&company_id=eq.${enc}&status=eq.true&order=name.asc`),
+      rest<{ id: string; name: string }[]>("activities_types?select=id,name&status=eq.true&order=name.asc"),
+      rest<{ id: number; code: string; symbol: string }[]>("currencys?select=id,code,symbol"),
+    ]);
+    const cur = new Map(currencies.map((c) => [c.id, c]));
+    return {
+      lost_reasons: reasons,
+      products: products.map((p) => ({ id: p.id, name: p.name, price: Number(p.price ?? 0), currency: cur.get(p.currency ?? 1)?.code ?? "BRL" })),
+      activity_types: types,
+    };
+  });
+
   /** Modelos aprovados do WhatsApp Business API da empresa (para o follow-up fora da janela de 24h). */
   app.get("/v1/makecrm/companies/:companyId/templates", async (req) => {
     const { companyId } = req.params as { companyId: string };

@@ -200,12 +200,12 @@ export type CreatedEvent = { id: string; link: string | null; calendarId: string
 
 export async function createEvent(
   token: Token,
-  input: { start: Date; end: Date; title: string; description: string; attendee?: string | null; meet: boolean },
+  input: { start: Date; end: Date; title: string; description: string; attendees: string[]; seeOthers: boolean; meet: boolean },
 ): Promise<CreatedEvent> {
   const cal = calendarOf(token);
   const ev = await gapi<{ id: string; hangoutLink?: string; htmlLink?: string }>(
     token,
-    `/calendars/${encodeURIComponent(cal)}/events?conferenceDataVersion=${input.meet ? 1 : 0}&sendUpdates=${input.attendee ? "all" : "none"}`,
+    `/calendars/${encodeURIComponent(cal)}/events?conferenceDataVersion=${input.meet ? 1 : 0}&sendUpdates=${input.attendees.length ? "all" : "none"}`,
     {
       method: "POST",
       body: JSON.stringify({
@@ -213,13 +213,31 @@ export async function createEvent(
         description: input.description,
         start: { dateTime: input.start.toISOString(), timeZone: "America/Sao_Paulo" },
         end: { dateTime: input.end.toISOString(), timeZone: "America/Sao_Paulo" },
-        ...(input.attendee ? { attendees: [{ email: input.attendee }] } : {}),
+        ...(input.attendees.length ? { attendees: input.attendees.map((email) => ({ email })), guestsCanSeeOtherGuests: input.seeOthers } : {}),
         ...(input.meet ? { conferenceData: { createRequest: { requestId: randomUUID(), conferenceSolutionKey: { type: "hangoutsMeet" } } } } : {}),
         reminders: { useDefault: false, overrides: [{ method: "popup", minutes: 10 }] },
       }),
     },
   );
   return { id: ev.id, link: ev.hangoutLink ?? null, calendarId: cal };
+}
+
+type Attendee = { email: string; responseStatus?: string; [k: string]: unknown };
+
+/**
+ * Inclui e tira convidados de um evento sem mexer nos outros (quem a equipe
+ * convidou direto no Google fica). O Google manda o convite aos novos e avisa
+ * quem saiu.
+ */
+export async function changeAttendees(token: Token, eventId: string, change: { add: string[]; remove: string[]; seeOthers: boolean }) {
+  const path = `/calendars/${encodeURIComponent(calendarOf(token))}/events/${encodeURIComponent(eventId)}`;
+  const ev = await gapi<{ attendees?: Attendee[] }>(token, path);
+  const removing = new Set(change.remove.map((e) => e.toLowerCase()));
+  const kept = (ev.attendees ?? []).filter((a) => !removing.has(a.email.toLowerCase()));
+  const have = new Set(kept.map((a) => a.email.toLowerCase()));
+  const attendees = [...kept, ...change.add.filter((e) => !have.has(e.toLowerCase())).map((email) => ({ email }))];
+  await gapi(token, `${path}?sendUpdates=all`, { method: "PATCH", body: JSON.stringify({ attendees, guestsCanSeeOtherGuests: change.seeOthers }) });
+  return attendees.map((a) => a.email);
 }
 
 export async function moveEvent(token: Token, eventId: string, start: Date, end: Date, notify: boolean) {
