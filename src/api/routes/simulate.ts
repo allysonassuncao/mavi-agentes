@@ -1,12 +1,18 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
+import { randomUUID } from "node:crypto";
 import { db } from "../../db.js";
+import { redis } from "../../redis.js";
 import { MEDIA_TYPES } from "../../runtime/inbound.js";
 import { runTurn } from "../../runtime/turn.js";
 import { parseSpec, type AgentSpec } from "../../spec/agent.js";
 import { assertUuid, HttpError, notFound, parseBody } from "../http.js";
 import { canCompany } from "../auth.js";
 import { loadAgent } from "./agents.js";
+
+/** A trava por conversa do worker (worker.ts): uma coisa por vez na conversa. */
+const convLockKey = (id: string) => `conv:lock:${id}`;
+const RELEASE = `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`;
 
 const Simulate = z.object({
   /** Chave da conversa de teste (ex.: "<pessoa>:<aba>"); a mesma chave continua a conversa. */
@@ -124,12 +130,58 @@ export async function simulateRoutes(app: FastifyInstance) {
 
   app.get("/v1/agents/:id/conversations", async (req) => {
     const a = await loadAgent(req, (req.params as { id: string }).id);
-    const q = req.query as { limit?: string };
+    const q = req.query as { limit?: string; q?: string };
+    // Busca por nome ou telefone (só os dígitos contam no telefone).
+    const term = String(q.q ?? "").trim().slice(0, 80);
+    const digits = term.replace(/\D/g, "");
+    const like = term ? `%${term.replace(/[%_\\]/g, (c) => `\\${c}`)}%` : null;
     const conversations = await db()`
-      select id, external_id, phone, contact_name, facts, summary, last_inbound_at, last_reply_at, created_at
-      from public.conversations where agent_id = ${a.id} and not simulation
-      order by coalesce(last_inbound_at, created_at) desc limit ${Math.min(Number(q.limit) || 50, 200)}`;
+      select id, external_id, phone, contact_name, facts, summary, last_inbound_at, last_reply_at, created_at,
+             memory_reset_at, memory_reset_by,
+             (select count(*) from public.messages m where m.conversation_id = c.id and m.role in ('user', 'assistant'))::int as messages
+      from public.conversations c where c.agent_id = ${a.id} and not c.simulation
+        and (${like}::text is null or c.contact_name ilike ${like} or (${digits} <> '' and regexp_replace(coalesce(c.phone, ''), '\\D', '', 'g') like ${`%${digits}%`}))
+      order by coalesce(c.last_inbound_at, c.created_at) desc limit ${Math.min(Number(q.limit) || 50, 200)}`;
     return { conversations };
+  });
+
+  /**
+   * Zera a memória do agente numa conversa: apaga as mensagens que ele guarda
+   * (o histórico que relê a cada resposta), o resumo, os dados coletados do
+   * contato e a leitura da MAVI; para o follow-up. Rastros e custos ficam
+   * (controle financeiro); o histórico no MakeCRM não muda.
+   */
+  app.post("/v1/agents/:id/conversations/:cid/reset", async (req) => {
+    const { id, cid } = req.params as { id: string; cid: string };
+    const a = await loadAgent(req, id);
+    assertUuid(cid, "Conversa");
+    const body = parseBody(z.object({ by: z.string().max(200).optional() }), req.body);
+    const by = body.by ?? req.client!.name;
+    const sql = db();
+    const [c] = await sql<{ id: string }[]>`select id from public.conversations where id = ${cid} and agent_id = ${a.id} and not simulation`;
+    if (!c) throw notFound("Conversa");
+    // A mesma trava das respostas (worker.ts): não zera no meio de uma resposta.
+    const token = randomUUID();
+    if (!(await redis().set(convLockKey(cid), token, "PX", 60_000, "NX")))
+      throw new HttpError(409, "O agente está respondendo este lead agora. Tente de novo em alguns segundos.");
+    try {
+      const removed = await sql.begin(async (tx) => {
+        const [m] = await tx<{ n: number }[]>`
+          with d as (delete from public.messages where conversation_id = ${cid} returning 1) select count(*)::int as n from d`;
+        await tx`delete from public.conversation_insights where conversation_id = ${cid}`;
+        await tx`
+          update public.conversations set summary = '', summary_upto = null, facts = '{}',
+            followup_step = 0, followup_state = 'idle', followup_next_at = null,
+            memory_reset_at = now(), memory_reset_by = ${by}
+          where id = ${cid}`;
+        // Fica uma nota (o agente não lê notas) para quem abrir a conversa saber.
+        await tx`insert into public.messages (conversation_id, role, content) values (${cid}, 'note', ${`Memória do agente zerada por ${by}.`})`;
+        return m!.n;
+      });
+      return { ok: true, removed_messages: removed };
+    } finally {
+      await redis().eval(RELEASE, 1, convLockKey(cid), token);
+    }
   });
 
   app.get("/v1/agents/:id/conversations/:cid/messages", async (req) => {

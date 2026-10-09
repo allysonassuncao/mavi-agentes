@@ -147,8 +147,56 @@ export async function runIntegrationTool(name: string, args: Record<string, unkn
   } catch (e) {
     const msg = e instanceof CalendarError ? e.message : "Não consegui concluir agora.";
     log.warn({ tool: name, agent: ctx.agentId, err: e instanceof Error ? e.message : String(e) }, "integração falhou");
+    await recordFailure(name, e, ctx).catch((err) => log.warn({ err: String(err) }, "integração: falha não registrada"));
     return { result: `Não deu certo: ${msg} Diga ao lead, com naturalidade, que vai confirmar e retornar; não invente que deu certo.` };
   }
+}
+
+// ---------------------------------------------------------------- falhas
+
+const INTEGRATION_OF: Record<string, string> = {
+  agenda_horarios_livres: "google_calendar",
+  agenda_marcar: "google_calendar",
+  agenda_remarcar: "google_calendar",
+  agenda_cancelar: "google_calendar",
+  mover_oportunidade: "makecrm_move_deal",
+  trocar_responsavel: "makecrm_change_owner",
+  avisar_equipe: "team_notify",
+};
+const INTEGRATION_LABEL: Record<string, string> = {
+  google_calendar: "Google Agenda",
+  makecrm_move_deal: "Mover oportunidade",
+  makecrm_change_owner: "Trocar responsável",
+  team_notify: "Avisar a equipe",
+};
+/** Uma falha avisa a equipe no máximo uma vez a cada 6 horas (por agente, integração e motivo). */
+const NOTIFY_EVERY_HOURS = 6;
+
+/**
+ * Registra a falha de uma integração numa conversa real (o construtor mostra
+ * o alerta) e avisa a equipe pela integração "Avisar a equipe", se ligada.
+ */
+export async function recordFailure(tool: string, e: unknown, ctx: IntegrationCtx): Promise<void> {
+  if (ctx.simulation) return;
+  const integration = INTEGRATION_OF[tool] ?? tool;
+  const code = e instanceof CalendarError ? e.code : "error";
+  const message = (e instanceof Error ? e.message : String(e)).slice(0, 2000);
+  const sql = db();
+  const [recent] = await sql<{ n: number }[]>`
+    select count(*)::int as n from public.integration_failures
+    where agent_id = ${ctx.agentId} and integration = ${integration} and code = ${code} and notified
+      and created_at > now() - make_interval(hours => ${NOTIFY_EVERY_HOURS})`;
+  const notify = integration !== "team_notify" ? get(ctx.spec, "team_notify") : undefined;
+  const willNotify = !!notify && !recent!.n;
+  await sql`
+    insert into public.integration_failures (agent_id, conversation_id, integration, tool, code, message, notified)
+    values (${ctx.agentId}, ${ctx.conversationId}, ${integration}, ${tool}, ${code}, ${message}, ${willNotify})`;
+  if (willNotify)
+    await sendTeamNotice(
+      notify!,
+      `⚠️ A integração ${INTEGRATION_LABEL[integration] ?? integration} falhou nesta conversa: ${message}\nO agente disse ao lead que a equipe vai confirmar. Corrija em MAVI Tasks › Agentes MAVI › Integrações.`,
+      ctx,
+    );
 }
 
 function need<T>(v: T | undefined): T {
@@ -177,14 +225,30 @@ async function searchSlots(cfg: GoogleCalendarConfig, args: Record<string, unkno
   const days = Math.max(1, Math.min(cfg.days_ahead, Math.round((Date.parse(lastDay) - Date.parse(from)) / 86_400_000) + 1));
   const period = typeof args.periodo === "string" && args.periodo !== "qualquer" ? args.periodo : null;
 
+  // Uma agenda com problema não derruba as outras; se nenhuma der certo, a
+  // falha sobe (e é registrada uma vez em runIntegrationTool).
+  const failures: unknown[] = [];
+  let read = 0;
   for (const host of await hostOrder(cfg, ctx)) {
     const token = await googleToken(ctx.companyId, host.user_id);
-    if (!token) continue;
+    if (!token) {
+      failures.push(new CalendarError("A agenda do anfitrião não está conectada no MakeCRM (conecte o Google Agenda dele lá).", "not_connected"));
+      continue;
+    }
     const start = new Date(`${from}T00:00:00-03:00`);
     const end = new Date(`${addDays(from, days)}T00:00:00-03:00`);
-    const busy = await busyTimes(token, start, end);
+    let busy;
+    try {
+      busy = await busyTimes(token, start, end);
+      read++;
+    } catch (e) {
+      failures.push(e);
+      continue;
+    }
     const slots = spreadSlots(freeSlots(cfg, busy, from, days), 6, period);
     if (!slots.length) continue;
+    // Achou com este anfitrião: as agendas com problema ficam registradas.
+    for (const f of failures) await recordFailure("agenda_horarios_livres", f, ctx).catch(() => {});
     const stored: Record<string, StoredSlot> = {};
     const lines = slots.map((s, i) => {
       stored[`H${i + 1}`] = { start: s.start.toISOString(), end: s.end.toISOString(), host: host.user_id };
@@ -193,10 +257,11 @@ async function searchSlots(cfg: GoogleCalendarConfig, args: Record<string, unkno
     await redis().set(slotsKey(ctx.conversationId), JSON.stringify(stored), "EX", 86_400);
     return { result: `Horários livres (${cfg.duration_minutes} min):\n${lines.join("\n")}\nOfereça 2 ou 3 destes ao lead.` };
   }
+  // Nenhuma agenda lida: é falha (registrada e avisada), não "sem horários".
+  if (!read && failures.length) throw failures[0];
+  for (const f of failures) await recordFailure("agenda_horarios_livres", f, ctx).catch(() => {});
   return {
-    result: cfg.hosts.length
-      ? "Não há horários livres no período (ou a agenda não está conectada no MakeCRM). Ofereça outro dia ou diga que a equipe vai retornar."
-      : "Nenhum anfitrião configurado.",
+    result: cfg.hosts.length ? "Não há horários livres no período. Ofereça outro dia ou diga que a equipe vai retornar." : "Nenhum anfitrião configurado.",
   };
 }
 
@@ -211,12 +276,15 @@ async function slotFor(cfg: GoogleCalendarConfig, value: string, ctx: Integratio
   if (start.getTime() < Date.now() + cfg.min_notice_minutes * 60_000) return "Esse horário é cedo demais. Busque os horários livres.";
   if (!withinAllowed(cfg, start, end)) return "Esse horário está fora dos dias/horários de agendamento. Busque os horários livres.";
   // Confere se está livre com o anfitrião da vez.
+  let connected = 0;
   for (const host of await hostOrder(cfg, ctx)) {
     const token = await googleToken(ctx.companyId, host.user_id);
     if (!token) continue;
+    connected++;
     const busy = await busyTimes(token, start, end);
     if (!busy.some((b) => start.getTime() < b.end && end.getTime() > b.start)) return { start: start.toISOString(), end: end.toISOString(), host: host.user_id };
   }
+  if (!connected) throw new CalendarError("A agenda do anfitrião não está conectada no MakeCRM (conecte o Google Agenda dele lá).", "not_connected");
   return "Esse horário não está livre. Busque os horários livres e ofereça outro.";
 }
 
@@ -237,7 +305,7 @@ async function schedule(cfg: GoogleCalendarConfig, args: Record<string, unknown>
     return { result: `Simulação: a reunião seria marcada para ${spLabel(start)}${email ? ` com convite para ${email}` : ""}. Confirme ao lead normalmente.`, action: { type: "agenda_marcar", start: slot.start, host: slot.host, simulation: true } };
   }
   const token = await googleToken(ctx.companyId, slot.host);
-  if (!token) return { result: "A agenda do anfitrião não está conectada no MakeCRM. Diga que a equipe vai confirmar o horário." };
+  if (!token) throw new CalendarError("A agenda do anfitrião não está conectada no MakeCRM (conecte o Google Agenda dele lá).", "not_connected");
   const description = [
     String(args.observacao ?? "").trim(),
     `Lead: ${lead}${ctx.phone ? ` (${ctx.phone})` : ""}`,

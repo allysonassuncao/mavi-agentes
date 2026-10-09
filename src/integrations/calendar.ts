@@ -13,17 +13,52 @@ import { addDays, hmToMin, spDate, spDayKey, spMinutes, spYmd } from "./time.js"
  * gravado de volta lá.
  */
 
-export class CalendarError extends Error {}
+/**
+ * Por que a agenda falhou, para dizer como corrigir:
+ * not_connected (ninguém conectou no MakeCRM), disconnected (acesso vencido
+ * ou revogado: reconectar), wrong_app (o aplicativo Google do motor não é o
+ * que conectou a agenda), no_app (o motor sem aplicativo Google),
+ * no_permission (sem acesso à agenda), not_found (evento/agenda), error.
+ */
+export type CalendarErrorCode = "not_connected" | "disconnected" | "wrong_app" | "no_app" | "no_permission" | "not_found" | "error";
 
-type Token = { id: number; user_id: string; access_token: string | null; refresh_token: string | null; external_id: string | null };
+export class CalendarError extends Error {
+  constructor(
+    message: string,
+    readonly code: CalendarErrorCode = "error",
+  ) {
+    super(message);
+  }
+}
+
+type Token = {
+  id: number;
+  user_id: string;
+  access_token: string | null;
+  refresh_token: string | null;
+  external_id: string | null;
+  /** O aplicativo Google que conectou a agenda (id_data.aud do MakeCRM). */
+  app: string | null;
+};
 
 /** A conta Google conectada do usuário (a mais recente). */
 export async function googleToken(companyId: string, userId: string): Promise<Token | null> {
-  const rows = await rest<Token[]>(
-    `meet_google_tokens?select=id,user_id,access_token,refresh_token,external_id&company_id=eq.${encodeURIComponent(companyId)}&user_id=eq.${encodeURIComponent(userId)}&order=id.desc&limit=1`,
+  const rows = await rest<(Omit<Token, "app"> & { id_data: { aud?: string; azp?: string } | null })[]>(
+    `meet_google_tokens?select=id,user_id,access_token,refresh_token,external_id,id_data&company_id=eq.${encodeURIComponent(companyId)}&user_id=eq.${encodeURIComponent(userId)}&order=id.desc&limit=1`,
   );
-  return rows[0] ?? null;
+  const r = rows[0];
+  if (!r) return null;
+  const { id_data, ...rest_ } = r;
+  return { ...rest_, app: id_data?.azp ?? id_data?.aud ?? null };
 }
+
+/** O aplicativo do motor é outro que o que conectou a agenda (a renovação vai falhar). */
+export function wrongApp(token: Pick<Token, "app">): boolean {
+  const mine = config().GOOGLE_OAUTH_CLIENT_ID;
+  return !!(mine && token.app && token.app !== mine);
+}
+const WRONG_APP =
+  "O aplicativo Google do motor (GOOGLE_OAUTH_CLIENT_ID) não é o mesmo que conectou esta agenda no MakeCRM: use o mesmo cliente OAuth do MakeCRM no motor.";
 
 /** Quem tem o Google conectado no MakeCRM (para o construtor). */
 export async function connectedUsers(companyId: string): Promise<{ user_id: string; email: string | null }[]> {
@@ -38,8 +73,9 @@ export async function connectedUsers(companyId: string): Promise<{ user_id: stri
 async function refresh(token: Token): Promise<string> {
   const c = config();
   if (!c.GOOGLE_OAUTH_CLIENT_ID || !c.GOOGLE_OAUTH_CLIENT_SECRET)
-    throw new CalendarError("O acesso à agenda venceu e o motor não tem o aplicativo Google configurado (GOOGLE_OAUTH_CLIENT_ID/SECRET).");
-  if (!token.refresh_token) throw new CalendarError("A agenda deste usuário precisa ser conectada de novo no MakeCRM.");
+    throw new CalendarError("O acesso à agenda venceu e o motor não tem o aplicativo Google configurado (GOOGLE_OAUTH_CLIENT_ID/SECRET).", "no_app");
+  if (wrongApp(token)) throw new CalendarError(WRONG_APP, "wrong_app");
+  if (!token.refresh_token) throw new CalendarError("A agenda deste usuário precisa ser conectada de novo no MakeCRM.", "disconnected");
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -53,9 +89,10 @@ async function refresh(token: Token): Promise<string> {
   });
   const j = (await res.json().catch(() => ({}))) as { access_token?: string; error?: string };
   if (!res.ok || !j.access_token) {
-    throw new CalendarError(
-      j.error === "invalid_grant" ? "A agenda deste usuário foi desconectada: conecte de novo no MakeCRM." : "Não consegui renovar o acesso à agenda.",
-    );
+    if (j.error === "invalid_client" || j.error === "unauthorized_client") throw new CalendarError(WRONG_APP, "wrong_app");
+    if (j.error === "invalid_grant")
+      throw new CalendarError("A agenda deste usuário foi desconectada (acesso vencido ou revogado): conecte de novo no MakeCRM.", "disconnected");
+    throw new CalendarError(`Não consegui renovar o acesso à agenda (${j.error ?? res.status}).`);
   }
   await rest(`meet_google_tokens?id=eq.${token.id}`, {
     method: "PATCH",
@@ -79,7 +116,9 @@ async function gapi<T>(token: Token, path: string, init: RequestInit = {}): Prom
   if (res.status === 204) return {} as T;
   const text = await res.text();
   if (!res.ok) {
-    if (res.status === 404) throw new CalendarError("Evento ou agenda não encontrado no Google.");
+    if (res.status === 404) throw new CalendarError("Evento ou agenda não encontrado no Google.", "not_found");
+    if (res.status === 401) throw new CalendarError("A agenda deste usuário foi desconectada: conecte de novo no MakeCRM.", "disconnected");
+    if (res.status === 403) throw new CalendarError("Sem permissão nesta agenda do Google (o usuário conectado não acessa a agenda escolhida).", "no_permission");
     throw new CalendarError(`O Google Agenda respondeu ${res.status}.`);
   }
   return (text ? JSON.parse(text) : {}) as T;
@@ -96,7 +135,7 @@ export async function busyTimes(token: Token, from: Date, to: Date): Promise<Bus
     body: JSON.stringify({ timeMin: from.toISOString(), timeMax: to.toISOString(), timeZone: "America/Sao_Paulo", items: [{ id: cal }] }),
   });
   const c = r.calendars?.[cal];
-  if (c?.errors?.length) throw new CalendarError("Não consegui ler a agenda (sem permissão ou agenda inexistente).");
+  if (c?.errors?.length) throw new CalendarError("Não consegui ler a agenda (sem permissão ou agenda inexistente).", "no_permission");
   return (c?.busy ?? []).map((b) => ({ start: Date.parse(b.start), end: Date.parse(b.end) }));
 }
 
@@ -198,7 +237,7 @@ export async function cancelEvent(token: Token, eventId: string, notify: boolean
     method: "DELETE",
   }).catch((e) => {
     // Já apagado no Google: segue para atualizar o MakeCRM.
-    if (!(e instanceof CalendarError && /não encontrado/.test(e.message))) throw e;
+    if (!(e instanceof CalendarError && e.code === "not_found")) throw e;
   });
 }
 
@@ -222,3 +261,32 @@ export const withinAllowed = (cfg: Pick<GoogleCalendarConfig, "allowed_hours">, 
   const b = spMinutes(end) || 24 * 60;
   return a >= hmToMin(win.from) && b <= (win.to === "23:59" ? 24 * 60 : hmToMin(win.to));
 };
+
+export type CalendarCheck = {
+  user_id: string;
+  email: string | null;
+  status: "ok" | CalendarErrorCode;
+  message: string;
+  /** Funciona agora, mas vai parar quando o acesso vencer (até 1 h): aplicativo trocado. */
+  warning?: string;
+};
+
+/** Testa a agenda de um usuário: lê as próximas 24 h (renovando o acesso se preciso). */
+export async function checkCalendar(companyId: string, userId: string): Promise<CalendarCheck> {
+  const token = await googleToken(companyId, userId).catch(() => null);
+  if (!token) return { user_id: userId, email: null, status: "not_connected", message: "Este usuário não conectou o Google Agenda no MakeCRM." };
+  const base = { user_id: userId, email: token.external_id };
+  try {
+    const now = new Date();
+    await busyTimes(token, now, new Date(now.getTime() + 86_400_000));
+    return {
+      ...base,
+      status: "ok",
+      message: "Agenda conectada e lida agora.",
+      ...(wrongApp(token) ? { warning: WRONG_APP } : {}),
+    };
+  } catch (e) {
+    if (e instanceof CalendarError) return { ...base, status: e.code, message: e.message };
+    return { ...base, status: "error", message: e instanceof Error ? e.message : String(e) };
+  }
+}

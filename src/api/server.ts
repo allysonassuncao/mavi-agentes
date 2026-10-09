@@ -10,6 +10,7 @@ import { inboundRoutes } from "./routes/inbound.js";
 import { insightRoutes } from "./routes/insights.js";
 import { costRoutes } from "./routes/costs.js";
 import { testRoutes } from "./routes/tests.js";
+import { integrationCheckRoutes } from "./routes/integration-checks.js";
 import { knowledgeRoutes } from "./routes/knowledge.js";
 import { secretRoutes } from "./routes/secrets.js";
 import { simulateRoutes } from "./routes/simulate.js";
@@ -47,6 +48,7 @@ export async function buildServer() {
     await admin.register(insightRoutes);
     await admin.register(costRoutes);
     await admin.register(testRoutes);
+    await admin.register(integrationCheckRoutes);
   });
 
   return app;
