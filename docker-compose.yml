@@ -8,8 +8,8 @@ services:
     command: ["node", "dist/main-api.js"]
     env_file: .env
     environment:
-      REDIS_URL: redis://redis:6379/0
-    depends_on: [redis]
+      REDIS_URL: redis://agentes-redis:6379/0
+    depends_on: [agentes-redis]
     restart: always
     networks: [interna, proxy]
     healthcheck:
@@ -31,15 +31,17 @@ services:
     command: ["node", "dist/main-worker.js"]
     env_file: .env
     environment:
-      REDIS_URL: redis://redis:6379/0
-    depends_on: [redis, api]
+      REDIS_URL: redis://agentes-redis:6379/0
+    depends_on: [agentes-redis, api]
     restart: always
     networks: [interna]
     # Mais capacidade: aumente as réplicas (cada uma com WORKER_CONCURRENCY respostas ao mesmo tempo).
     deploy: { replicas: 2 }
     logging: { driver: json-file, options: { max-size: "10m", max-file: "5" } }
 
-  redis:
+  # Nome único: a api também está na rede do Traefik, onde outras stacks podem
+  # ter um serviço "redis" (o nome curto resolveria para o Redis de outra stack).
+  agentes-redis:
     image: redis:7.4-alpine
     command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
     volumes: [redis-data:/data]
