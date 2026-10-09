@@ -2,6 +2,7 @@ import { config } from "../config.js";
 import { db } from "../db.js";
 import { chat } from "../llm/client.js";
 import { agentKeys } from "../secrets.js";
+import { recordCost } from "../costs/ledger.js";
 
 /**
  * Relatório do agente num período: números exatos dos registros do motor
@@ -157,8 +158,8 @@ export async function gapStats(agentId: string, p: Period) {
     )
     select
       (select count(*) from public.turns t, b where t.agent_id = ${agentId} and not t.simulation and t.status = 'done' and t.created_at >= b.s and t.created_at < b.e)::int as turns,
-      (select count(distinct g.turn_id) from public.gaps g, b where g.agent_id = ${agentId} and g.created_at >= b.s and g.created_at < b.e)::int as gap_turns,
-      (select count(*) from public.gaps g, b where g.agent_id = ${agentId} and g.created_at >= b.s and g.created_at < b.e)::int as gaps,
+      (select count(distinct g.turn_id) from public.gaps g, b where g.agent_id = ${agentId} and g.origin = 'live' and g.created_at >= b.s and g.created_at < b.e)::int as gap_turns,
+      (select count(*) from public.gaps g, b where g.agent_id = ${agentId} and g.origin = 'live' and g.created_at >= b.s and g.created_at < b.e)::int as gaps,
       (select count(*) from public.gap_topics t, b where t.agent_id = ${agentId} and t.first_seen_at >= b.s and t.first_seen_at < b.e)::int as new_topics`;
   const coverage = r!.turns ? Math.max(0, 1 - r!.gap_turns / r!.turns) : null;
   return { ...r!, coverage };
@@ -293,6 +294,7 @@ export async function generateReading(agentId: string, r: Report): Promise<{ rea
       { role: "user", content: digest },
     ],
   });
+  await recordCost({ agentId, source: "reading", usage: res.usage, model: res.model, meta: { from: r.period.from, to: r.period.to } });
   const j = JSON.parse(res.message.content ?? "{}") as { resumo?: unknown; pontos?: unknown };
   // Os códigos das conversas não aparecem no texto (as evidências vão em "conversations").
   const noRefs = (t: unknown) => String(t ?? "").replace(/\s*\(?\bC\d+(?:\s*[,e]\s*C\d+)*\)?/g, "").replace(/\s+([.,;:])/g, "$1").trim();

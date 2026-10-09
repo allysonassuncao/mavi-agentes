@@ -4,6 +4,7 @@ import { chat } from "../llm/client.js";
 import { log } from "../log.js";
 import { publishedSpec } from "../runtime/turn.js";
 import { agentKeys } from "../secrets.js";
+import { recordCost } from "../costs/ledger.js";
 
 /**
  * Leitura de cada conversa (na amostra do agente) quando ela esfria: intenção,
@@ -157,6 +158,7 @@ export async function analyzeConversation(conversationId: string): Promise<boole
       },
     ],
   });
+  await recordCost({ agentId: conv.agent_id, conversationId: conv.id, source: "insight", usage: r.usage, model: r.model });
   const ins = parseInsight(JSON.parse(r.message.content ?? "{}"));
   const lastId = msgs[msgs.length - 1]!.id;
   await sql`

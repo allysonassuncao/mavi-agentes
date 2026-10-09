@@ -237,13 +237,41 @@ export async function embed(texts: string[]): Promise<{ vectors: number[][]; usa
 
 // ---------------------------------------------------------------- transcrição
 
-export async function transcribe(audio: Blob, filename: string): Promise<string> {
+/** Preço da transcrição (US$): por milhão de tokens (modelos gpt-4o) ou por minuto (whisper). */
+const TRANSCRIBE_PRICE: Record<string, { audio: number; text: number; out: number } | { minute: number }> = {
+  "gpt-4o-mini-transcribe": { audio: 3, text: 1.25, out: 5 },
+  "gpt-4o-transcribe": { audio: 6, text: 2.5, out: 10 },
+  "whisper-1": { minute: 0.006 },
+};
+
+type TranscribeUsage =
+  | { type: "tokens"; input_tokens?: number; output_tokens?: number; input_token_details?: { audio_tokens?: number; text_tokens?: number } }
+  | { type: "duration"; seconds?: number };
+
+/** O custo de uma transcrição pelo que a OpenAI devolve (tokens ou segundos). */
+export function transcribeCost(model: string, u: TranscribeUsage | null | undefined): { usage: Usage; units: number } {
+  const price = TRANSCRIBE_PRICE[model];
+  if (!u || !price) return { usage: emptyUsage(), units: 0 };
+  if (u.type === "duration") {
+    const seconds = u.seconds ?? 0;
+    const cost = "minute" in price ? (seconds / 60) * price.minute : 0;
+    return { usage: { tokensIn: 0, tokensOut: 0, tokensCached: 0, costUsd: cost }, units: seconds };
+  }
+  const audio = u.input_token_details?.audio_tokens ?? u.input_tokens ?? 0;
+  const text = u.input_token_details?.text_tokens ?? 0;
+  const out = u.output_tokens ?? 0;
+  const cost = "audio" in price ? (audio * price.audio + text * price.text + out * price.out) / 1e6 : 0;
+  return { usage: { tokensIn: audio + text, tokensOut: out, tokensCached: 0, costUsd: cost }, units: audio };
+}
+
+export async function transcribe(audio: Blob, filename: string): Promise<{ text: string; usage: Usage; units: number; model: string }> {
   const c = config();
   if (!c.OPENAI_API_KEY) throw new LlmError("OPENAI_API_KEY não configurada (transcrição).", 0, false);
   const form = new FormData();
   form.append("file", audio, filename);
   form.append("model", c.TRANSCRIBE_MODEL);
   form.append("language", "pt");
+  form.append("response_format", "json");
   const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
     method: "POST",
     headers: { authorization: `Bearer ${c.OPENAI_API_KEY}` },
@@ -251,6 +279,6 @@ export async function transcribe(audio: Blob, filename: string): Promise<string>
     signal: AbortSignal.timeout(120_000),
   });
   if (!res.ok) throw new LlmError(`Transcrição ${res.status}: ${(await res.text()).slice(0, 300)}`, res.status, res.status >= 500);
-  const j = (await res.json()) as { text?: string };
-  return (j.text ?? "").trim();
+  const j = (await res.json()) as { text?: string; usage?: TranscribeUsage };
+  return { text: (j.text ?? "").trim(), ...transcribeCost(c.TRANSCRIBE_MODEL, j.usage), model: c.TRANSCRIBE_MODEL };
 }

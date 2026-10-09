@@ -9,6 +9,7 @@ import { publishedSpec } from "../runtime/turn.js";
 import { parseSpec, type AgentSpec } from "../spec/agent.js";
 import { agentKeys } from "../secrets.js";
 import type { GapKind } from "./gap-capture.js";
+import { recordCost } from "../costs/ledger.js";
 
 /**
  * Lacunas do treinamento. Na mesma chamada em que responde, o agente avisa
@@ -48,7 +49,18 @@ export async function clusterGaps(limit = 300): Promise<number> {
   const rows = await sql<{ id: string; agent_id: string; kind: GapKind; text: string; category: string }[]>`
     select id, agent_id, kind, text, category from public.gaps where topic_id is null order by id limit ${limit}`;
   if (!rows.length) return 0;
-  const { vectors } = await embed(rows.map((r) => r.text));
+  const { vectors, usage, model } = await embed(rows.map((r) => r.text));
+  // O custo dos vetores, dividido pelos agentes do lote.
+  const byAgent = new Map<string, number>();
+  for (const r of rows) byAgent.set(r.agent_id, (byAgent.get(r.agent_id) ?? 0) + 1);
+  for (const [agentId, n] of byAgent)
+    await recordCost({
+      agentId,
+      source: "gaps",
+      model,
+      usage: { tokensIn: Math.round((usage.tokensIn * n) / rows.length), tokensOut: 0, tokensCached: 0, costUsd: (usage.costUsd * n) / rows.length },
+      meta: { step: "agrupar", gaps: n },
+    });
   const touched = new Set<string>();
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i]!;
@@ -101,6 +113,7 @@ async function nameTopics(ids: string[]) {
         { role: "user", content: samples.map((s) => `- ${s.text}`).join("\n") },
       ],
     });
+    await recordCost({ agentId: t.agent_id, source: "gaps", usage: r.usage, model: r.model, meta: { step: "titulo", topic: t.id } });
     const title = String((JSON.parse(r.message.content ?? "{}") as { titulo?: unknown }).titulo ?? "").trim().slice(0, 200);
     if (title) await sql`update public.gap_topics set title = ${title}, title_source = 'mavi', updated_at = now() where id = ${t.id} and title_source = 'first'`;
   }
@@ -202,6 +215,7 @@ export async function suggestForTopic(topicId: string): Promise<GapSuggestion> {
       },
     ],
   });
+  await recordCost({ agentId: t.agent_id, source: "gaps", usage: r.usage, model: r.model, meta: { step: "sugestao", topic: t.id } });
   const j = JSON.parse(r.message.content ?? "{}") as { pergunta?: unknown; resposta?: unknown; observacao?: unknown };
   const suggestion: GapSuggestion = {
     question: String(j.pergunta ?? t.title).trim().slice(0, 300) || t.title,

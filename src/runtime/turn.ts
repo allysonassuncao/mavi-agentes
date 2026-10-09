@@ -10,6 +10,7 @@ import { understandMedia } from "./media.js";
 import { agentKeys } from "../secrets.js";
 import { INTEGRATION_TOOL_NAMES, integrationTools, runIntegrationTool, type IntegrationCtx } from "../integrations/index.js";
 import { parseGaps, recordGaps, type GapDraft } from "../insights/gap-capture.js";
+import { recordCost, type CostSource } from "../costs/ledger.js";
 import { normalizeReply, splitPlainText, typingDelayMs, type ReplyMessage } from "./output.js";
 import { buildSystemPrompt, contextBlock } from "./prompt.js";
 import { builtinTools, formatResults, RefRegistry, REPLY_TOOL } from "./tools.js";
@@ -167,12 +168,17 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
   let retrievedLog: { ref: string; chunk_id: string; kind: string; title: string; score: number; via: string }[] = [];
 
   try {
+    // Cada gasto da vez vai separado para o registro de custos (o total fica no rastro).
+    const cost = (source: CostSource, u: Usage, extra: { model?: string | null; messageId?: string; units?: number; meta?: Record<string, unknown> } = {}) =>
+      recordCost({ agentId: conv.agent_id, conversationId: conv.id, turnId, simulation: conv.simulation, source, usage: u, ...extra });
+
     // 1. Mídias
     let tm = Date.now();
     for (const m of pending) {
       if (!m.media?.url || m.media.processed) continue;
       const r = await understandMedia(spec, m.content_type, m.media.url, m.content);
       usage = addUsage(usage, r.usage);
+      await cost(MEDIA_SOURCE[m.content_type] ?? "media_document", r.usage, { model: r.model, messageId: m.id, units: r.units, meta: { content_type: m.content_type } });
       m.content = r.text;
       m.media = { ...m.media, processed: true, description: r.description, ...(r.error ? { error: r.error } : {}) };
       await sql`update public.messages set content = ${m.content}, media = ${sql.json(m.media as never)} where id = ${m.id}`;
@@ -197,6 +203,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
       const query = pendingText.length < 60 && lastAssistant ? `${lastAssistant.slice(-300)}\n${pendingText}` : pendingText;
       const r = await searchKnowledge({ agentId: conv.agent_id, query, k: spec.knowledge.prefetch_k, rerank: spec.knowledge.rerank });
       usage = addUsage(usage, r.usage);
+      await cost("retrieval", r.usage, { meta: { via: "prefetch" } });
       prefetch = r.results;
     }
     const retrievedForPrompt = prefetch.map((r) => ({ ref: reg.add(r), kind: r.kind, title: r.title, content: r.content }));
@@ -248,6 +255,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
       );
       usage = addUsage(usage, res.usage);
       usedModel = res.model;
+      await cost("reply", res.usage, { model: res.model, meta: { round: rounds } });
       const calls = res.message.tool_calls ?? [];
       if (!calls.length) {
         // Provedor que ignorou "required": o texto vira a resposta.
@@ -276,6 +284,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
             const kinds = typeof args.tipo === "string" ? [args.tipo] : null;
             const r = await searchKnowledge({ agentId: conv.agent_id, query: String(args.consulta ?? ""), k: 6, kinds, rerank: spec.knowledge.rerank });
             usage = addUsage(usage, r.usage);
+            await cost("retrieval", r.usage, { meta: { via: "tool" } });
             result = formatResults(reg, r.results);
             for (const x of r.results) retrievedLog.push({ ref: reg.add(x), chunk_id: x.chunk_id, kind: x.kind, title: x.title, score: x.score, via: "tool" });
             break;
@@ -452,6 +461,15 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
   }
 }
 
+const MEDIA_SOURCE: Record<string, CostSource> = {
+  ptt: "media_audio",
+  audio: "media_audio",
+  image: "media_image",
+  sticker: "media_image",
+  video: "media_video",
+  document: "media_document",
+};
+
 const MIME_BY_EXT: Record<string, string> = {
   jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", gif: "image/gif",
   mp4: "video/mp4", mov: "video/quicktime", mp3: "audio/mpeg", ogg: "audio/ogg", m4a: "audio/mp4",
@@ -489,6 +507,7 @@ async function maybeSummarize(conv: ConversationRow, spec: AgentSpec) {
   const transcript = old.map((m) => `${m.role === "user" ? "Lead" : "Agente"}: ${m.content}`).join("\n").slice(-30_000);
   const r = await chat({
     model: config().UTILITY_MODEL,
+    keys: await agentKeys(conv.agent_id),
     maxTokens: 700,
     timeoutMs: 60_000,
     messages: [
@@ -500,6 +519,7 @@ async function maybeSummarize(conv: ConversationRow, spec: AgentSpec) {
       { role: "user", content: `Resumo atual:\n${conv.summary || "(vazio)"}\n\nNovas mensagens:\n${transcript}` },
     ],
   });
+  await recordCost({ agentId: conv.agent_id, conversationId: conv.id, simulation: conv.simulation, source: "summary", usage: r.usage, model: r.model });
   const summary = (r.message.content ?? "").trim();
   if (summary) {
     await sql`update public.conversations set summary = ${summary}, summary_upto = ${old[old.length - 1]!.id} where id = ${conv.id}`;

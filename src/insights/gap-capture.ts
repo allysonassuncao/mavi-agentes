@@ -24,12 +24,21 @@ export function parseGaps(raw: unknown): GapDraft[] {
   return out;
 }
 
-export async function recordGaps(input: { agentId: string; conversationId: string; turnId: string; leadText: string; gaps: GapDraft[] }) {
+export async function recordGaps(input: {
+  agentId: string;
+  conversationId: string;
+  turnId: string | null;
+  leadText: string;
+  gaps: GapDraft[];
+  /** live: conversa real; test: achada num teste com lead simulado. */
+  origin?: "live" | "test";
+}) {
   if (!input.gaps.length) return;
   const sql = db();
   for (const g of input.gaps) {
     await sql`
-      insert into public.gaps (agent_id, conversation_id, turn_id, kind, text, category, lead_text)
-      values (${input.agentId}, ${input.conversationId}, ${input.turnId}, ${g.kind}, ${g.text}, ${g.category}, ${input.leadText.slice(0, 1000)})`;
+      insert into public.gaps (agent_id, conversation_id, turn_id, kind, text, category, lead_text, origin)
+      values (${input.agentId}, ${input.conversationId}, ${input.turnId}, ${g.kind}, ${g.text}, ${g.category}, ${input.leadText.slice(0, 1000)},
+              ${input.origin ?? "live"})`;
   }
 }

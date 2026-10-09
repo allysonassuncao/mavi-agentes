@@ -1,6 +1,7 @@
 import { config } from "../config.js";
 import { db, toVector } from "../db.js";
-import { chat, embed } from "../llm/client.js";
+import { addUsage, chat, embed, emptyUsage, type Usage } from "../llm/client.js";
+import { recordCost } from "../costs/ledger.js";
 import { log } from "../log.js";
 import { fetchPublic } from "../net.js";
 import { sha256 } from "../crypto.js";
@@ -51,9 +52,11 @@ export async function ingestItem(itemId: string): Promise<void> {
     const drafts = chunkItem({ kind: item.kind, title: item.title, body, data: item.data });
     if (!drafts.length) throw new Error("Item sem conteúdo.");
 
-    const contexts = item.kind === "document" && drafts.length > 1 ? await contextualize(item.title, body, drafts) : drafts.map(() => "");
+    const ctx = item.kind === "document" && drafts.length > 1 ? await contextualize(item.title, body, drafts) : { contexts: drafts.map(() => ""), usage: emptyUsage() };
+    const contexts = ctx.contexts;
     const texts = drafts.map((d, i) => [d.title, contexts[i], d.content].filter(Boolean).join("\n"));
-    const { vectors, model } = await embed(texts);
+    const { vectors, model, usage: embedUsage } = await embed(texts);
+    await recordCost({ agentId: item.agent_id, source: "knowledge", usage: addUsage(ctx.usage, embedUsage), model, meta: { item: item.id, chunks: drafts.length } });
 
     await sql.begin(async (tx) => {
       await tx`delete from public.knowledge_chunks where item_id = ${item.id}`;
@@ -79,9 +82,10 @@ export async function ingestItem(itemId: string): Promise<void> {
 }
 
 /** Uma frase por trecho dizendo de onde ele é e do que trata (melhora muito a busca). */
-async function contextualize(title: string, body: string, drafts: ChunkDraft[]): Promise<string[]> {
+async function contextualize(title: string, body: string, drafts: ChunkDraft[]): Promise<{ contexts: string[]; usage: Usage }> {
   const doc = body.slice(0, 14_000);
   const out: string[] = [];
+  let usage = emptyUsage();
   for (let i = 0; i < drafts.length; i += 8) {
     const batch = drafts.slice(i, i + 8);
     try {
@@ -104,6 +108,7 @@ async function contextualize(title: string, body: string, drafts: ChunkDraft[]):
           },
         ],
       });
+      usage = addUsage(usage, r.usage);
       const parsed = JSON.parse(r.message.content ?? "{}") as { contextos?: unknown };
       const list = Array.isArray(parsed.contextos) ? parsed.contextos : [];
       batch.forEach((_, j) => out.push(typeof list[j] === "string" ? (list[j] as string).slice(0, 400) : ""));
@@ -112,5 +117,5 @@ async function contextualize(title: string, body: string, drafts: ChunkDraft[]):
       batch.forEach(() => out.push(""));
     }
   }
-  return out;
+  return { contexts: out, usage };
 }

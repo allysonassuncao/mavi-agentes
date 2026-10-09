@@ -3,7 +3,8 @@ import { randomUUID } from "node:crypto";
 import { config } from "./config.js";
 import { ingestItem } from "./knowledge/ingest.js";
 import { log } from "./log.js";
-import { QUEUE, scheduleFollowup, scheduleTurn, type FollowupJob, type KnowledgeJob, type TurnJob } from "./queue.js";
+import { QUEUE, scheduleFollowup, scheduleTestConversation, scheduleTurn, type FollowupJob, type KnowledgeJob, type TestJob, type TurnJob } from "./queue.js";
+import { runConversation, startRun } from "./tests/runner.js";
 import { db } from "./db.js";
 import { processFollowup } from "./runtime/followup.js";
 import { analyzeDue } from "./insights/analyze.js";
@@ -81,6 +82,10 @@ async function insightsTick() {
 }
 
 export function startWorkers() {
+  // Gastos feitos pela imagem anterior (antes do registro separado de custos) entram no relatório.
+  void db()`select public.cost_backfill() as n`
+    .then(([r]) => r?.n && log.info({ n: r.n }, "custos: gastos antigos registrados"))
+    .catch((e) => log.warn({ err: String(e) }, "custos: backfill falhou"));
   const turns = new Worker<TurnJob | FollowupJob>(
     QUEUE.turns,
     async (job) => (job.name === "followup" ? processFollowupJob(job.data as FollowupJob) : processTurn(job.data as TurnJob)),
@@ -92,7 +97,13 @@ export function startWorkers() {
     connection: redisConnection(true),
     concurrency: 4,
   });
-  for (const w of [turns, knowledge]) {
+  // Testes com leads simulados: poucas conversas ao mesmo tempo (não disputam com as reais).
+  const tests = new Worker<TestJob>(
+    QUEUE.tests,
+    async (job) => (job.name === "test-run" ? (await startRun(job.data.runId, scheduleTestConversation), "começou") : runConversation(job.data.runId, job.data.idx ?? 0)),
+    { connection: redisConnection(true), concurrency: 3 },
+  );
+  for (const w of [turns, knowledge, tests]) {
     w.on("failed", (job, err) => log.error({ queue: w.name, job: job?.id, err: err.message }, "worker: job falhou"));
     w.on("error", (err) => log.error({ queue: w.name, err: err.message }, "worker: erro"));
   }
@@ -102,5 +113,5 @@ export function startWorkers() {
     clearInterval(tick);
     clearInterval(insights);
   });
-  return [turns, knowledge];
+  return [turns, knowledge, tests];
 }

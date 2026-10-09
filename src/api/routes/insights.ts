@@ -78,7 +78,7 @@ export async function insightRoutes(app: FastifyInstance) {
              knowledge_item_id, trained_at, trained_by, first_seen_at, last_seen_at
       from public.gap_topics where id = ${t.id}`;
     const examples = await db()`
-      select g.id, g.text, g.lead_text, g.created_at, g.conversation_id, c.external_id, c.contact_name, c.phone
+      select g.id, g.text, g.lead_text, g.created_at, g.conversation_id, c.external_id, c.contact_name, c.phone, g.origin
       from public.gaps g join public.conversations c on c.id = g.conversation_id
       where g.topic_id = ${t.id} order by g.id desc limit 30`;
     // Temas parecidos (para juntar).

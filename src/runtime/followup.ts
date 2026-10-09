@@ -7,6 +7,7 @@ import { chatWithFallback, type ChatMessage } from "../llm/client.js";
 import { log } from "../log.js";
 import { conversationAiOn, inboxType, listTemplates, rest, sendMessage, sendTemplate, wabaWindowOpen } from "../makecrm/client.js";
 import { agentKeys } from "../secrets.js";
+import { categoryOf, countryOf, recordCost, wabaPrice } from "../costs/ledger.js";
 import type { FollowupStepT, FollowupT } from "../spec/followup.js";
 import type { TeamNotifyConfig } from "../spec/integrations.js";
 import type { WeeklyHours } from "../spec/weekly-hours.js";
@@ -104,6 +105,18 @@ export async function processFollowup(conversationId: string, step: number): Pro
           const params = s.template.params.map((p) => fill(p, vars));
           await sendTemplate({ companyId: conv.company_id, conversationId: conv.external_id, inboxId: ctx.inboxId!, maviUserId: conv.mavi_user_id, template: tpl, params });
           texts = [`[modelo ${tpl.name}] ${params.join(" · ")}`];
+          // WhatsApp Business API: a Meta cobra o modelo aprovado pela categoria e pelo país (tabela do Painel).
+          const country = countryOf(conv.phone);
+          const category = categoryOf(tpl.category);
+          await recordCost({
+            agentId: conv.agent_id,
+            conversationId: conv.id,
+            turnId,
+            source: "waba_template",
+            units: 1,
+            costUsd: await wabaPrice(country, category).catch(() => 0),
+            meta: { template: tpl.name, category, country, followup: step },
+          });
         }
       }
     } else if (s.mode === "fixed") {
@@ -139,6 +152,7 @@ export async function processFollowup(conversationId: string, step: number): Pro
       );
       usage = res.usage;
       model = res.model;
+      await recordCost({ agentId: conv.agent_id, conversationId: conv.id, turnId, source: "followup", usage: res.usage, model: res.model, meta: { step } });
       texts = (res.message.content ?? "")
         .split(/\n\s*\n/)
         .map((t) => cleanText(t, spec))

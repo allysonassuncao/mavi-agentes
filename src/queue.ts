@@ -1,18 +1,25 @@
 import { Queue } from "bullmq";
 import { redisConnection } from "./redis.js";
 
-export const QUEUE = { turns: "turns", knowledge: "knowledge" } as const;
+export const QUEUE = { turns: "turns", knowledge: "knowledge", tests: "tests" } as const;
 
 export type TurnJob = { conversationId: string; messageId: string; attempt?: number };
 export type FollowupJob = { conversationId: string; step: number; attempt?: number };
 export type KnowledgeJob = { itemId: string };
+/** Testes com leads simulados: começar a bateria ou uma conversa dela. */
+export type TestJob = { runId: string; idx?: number };
 
 let turns: Queue<TurnJob | FollowupJob> | null = null;
 let knowledge: Queue<KnowledgeJob> | null = null;
+let tests: Queue<TestJob> | null = null;
 
 export function turnsQueue() {
   turns ??= new Queue<TurnJob | FollowupJob>(QUEUE.turns, { connection: redisConnection() });
   return turns;
+}
+export function testsQueue() {
+  tests ??= new Queue<TestJob>(QUEUE.tests, { connection: redisConnection() });
+  return tests;
 }
 export function knowledgeQueue() {
   knowledge ??= new Queue<KnowledgeJob>(QUEUE.knowledge, { connection: redisConnection() });
@@ -61,7 +68,14 @@ export async function scheduleIngest(itemId: string) {
   );
 }
 
+export async function scheduleTestRun(runId: string) {
+  await testsQueue().add("test-run", { runId }, { jobId: `tr-${runId}`, removeOnComplete: { count: 500 }, removeOnFail: { count: 1000 } });
+}
+export async function scheduleTestConversation(runId: string, idx: number) {
+  await testsQueue().add("test-conv", { runId, idx }, { jobId: `tc-${runId}-${idx}`, removeOnComplete: { count: 2000 }, removeOnFail: { count: 2000 } });
+}
+
 export async function closeQueues() {
-  await Promise.all([turns?.close(), knowledge?.close()]);
-  turns = knowledge = null;
+  await Promise.all([turns?.close(), knowledge?.close(), tests?.close()]);
+  turns = knowledge = tests = null;
 }
