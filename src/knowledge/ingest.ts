@@ -40,9 +40,12 @@ export async function ingestItem(itemId: string): Promise<void> {
   try {
     let body = item.body;
     const src = item.source ?? {};
-    if (src.type === "upload" && src.storage_path) {
+    // Só documento tem texto para ler no arquivo; mídia (imagem, vídeo, áudio)
+    // é encontrada pela descrição e enviada como arquivo.
+    const readFile = item.kind === "document";
+    if (readFile && src.type === "upload" && src.storage_path) {
       body = await extractFile(await getObject(src.storage_path), src.mime ?? "", src.filename ?? "");
-    } else if (src.type === "url" && src.url) {
+    } else if (readFile && src.type === "url" && src.url) {
       const file = await fetchPublic(src.url, { maxBytes: MAX_DOWNLOAD, accept: "text/html,application/pdf,text/plain;q=0.9,*/*;q=0.5" });
       body = await extractFile(file.bytes, file.mime, new URL(file.finalUrl).pathname);
     }
@@ -70,7 +73,7 @@ export async function ingestItem(itemId: string): Promise<void> {
       await tx`
         update public.knowledge_items
         set status = 'ready', error = null, chunk_count = ${drafts.length}, updated_at = now(),
-            body = ${src.type === "upload" || src.type === "url" ? body : item.body},
+            body = ${readFile && (src.type === "upload" || src.type === "url") ? body : item.body},
             content_hash = ${sha256(texts.join("\n"))}
         where id = ${item.id}`;
     });
