@@ -29,6 +29,21 @@ describe("especificação do agente", () => {
   });
 });
 
+describe("horário da semana", () => {
+  it("aceita dias abertos e fechados e vai para o prompt", () => {
+    const r = parseSpec({ ...minimal, instructions: { ...minimal.instructions, weekly_hours: { mon: { from: "09:00", to: "18:00" }, sun: null } } });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const p = buildSystemPrompt(r.spec);
+    expect(p).toContain("- Segunda: 09:00 às 18:00");
+    expect(p).toContain("- Domingo: fechado");
+  });
+  it("recusa horário invertido", () => {
+    const r = parseSpec({ ...minimal, instructions: { ...minimal.instructions, weekly_hours: { mon: { from: "18:00", to: "09:00" } } } });
+    expect(r.ok).toBe(false);
+  });
+});
+
 describe("prompt", () => {
   it("núcleo estável não depende da hora", () => {
     const r = parseSpec(minimal);

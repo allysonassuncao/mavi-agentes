@@ -30,7 +30,7 @@ services:
       resources: { limits: { cpus: "1.0", memory: 768M } }
       labels: &traefik
         - traefik.enable=true
-        - traefik.docker.network=${PROXY_NETWORK:-allyson-desenv}
+        - traefik.docker.network=${PROXY_NETWORK:-maso-app-desenv}
         - traefik.http.routers.mavi-agentes.rule=Host(`agentes.maso.app.br`)
         - traefik.http.routers.mavi-agentes.entrypoints=websecure
         - traefik.http.routers.mavi-agentes.tls.certresolver=letsencryptresolver
@@ -66,4 +66,4 @@ networks:
   interna:
   proxy:
     external: true
-    name: ${PROXY_NETWORK:-allyson-desenv}
+    name: ${PROXY_NETWORK:-maso-app-desenv}

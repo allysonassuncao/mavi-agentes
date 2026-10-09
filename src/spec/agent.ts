@@ -31,6 +31,18 @@ export const Persona = z
   })
   .strict();
 
+const Time = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "Horário no formato HH:MM");
+const Day = z
+  .object({ from: Time, to: Time })
+  .strict()
+  .refine((d) => d.from < d.to, "O horário de início deve ser antes do fim.")
+  .nullable();
+/** Horário da semana (null = fechado; ausente = não informado). */
+export const WeeklyHours = z
+  .object({ mon: Day.optional(), tue: Day.optional(), wed: Day.optional(), thu: Day.optional(), fri: Day.optional(), sat: Day.optional(), sun: Day.optional() })
+  .strict();
+export type WeeklyHours = z.infer<typeof WeeklyHours>;
+
 export const Instructions = z
   .object({
     goal: z.string().trim().min(1).max(4000),
@@ -38,7 +50,9 @@ export const Instructions = z
     conversation_guide: text(20000).default(""),
     rules: list(60, 1000).default([]),
     never: list(60, 1000).default([]),
+    /** Observações sobre horários (feriados, plantão…). */
     business_hours: text(2000).default(""),
+    weekly_hours: WeeklyHours.nullable().default(null),
     /** Texto livre (prompts trazidos do n8n entram aqui enquanto não são quebrados em blocos). */
     extra: text(60000).default(""),
   })

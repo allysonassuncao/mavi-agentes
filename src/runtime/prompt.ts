@@ -1,4 +1,25 @@
-import type { AgentSpec } from "../spec/agent.js";
+import type { AgentSpec, WeeklyHours } from "../spec/agent.js";
+
+const DAY_NAMES: [keyof WeeklyHours, string][] = [
+  ["mon", "Segunda"],
+  ["tue", "Terça"],
+  ["wed", "Quarta"],
+  ["thu", "Quinta"],
+  ["fri", "Sexta"],
+  ["sat", "Sábado"],
+  ["sun", "Domingo"],
+];
+
+/** Uma linha por dia informado ("Segunda: 09:00 às 18:00", "Domingo: fechado"). */
+export function weeklyHoursText(h: WeeklyHours | null | undefined): string {
+  if (!h) return "";
+  return DAY_NAMES.filter(([k]) => h[k] !== undefined)
+    .map(([k, name]) => {
+      const d = h[k];
+      return `- ${name}: ${d ? `${d.from} às ${d.to}` : "fechado"}`;
+    })
+    .join("\n");
+}
 
 /**
  * O prompt de sistema é só o núcleo estável do agente: muda apenas quando uma
@@ -34,7 +55,8 @@ export function buildSystemPrompt(spec: AgentSpec): string {
   parts.push(`# Seu objetivo\n${ins.goal.trim()}`);
   if (ins.conversation_guide.trim()) parts.push(`# Como conduzir a conversa\n${ins.conversation_guide.trim()}`);
   if (ins.rules.length) parts.push(`# Regras\n${bullets(ins.rules)}`);
-  if (ins.business_hours.trim()) parts.push(`# Horários de funcionamento\n${ins.business_hours.trim()}`);
+  const hours = [weeklyHoursText(ins.weekly_hours), ins.business_hours.trim()].filter(Boolean).join("\n");
+  if (hours) parts.push(`# Horários de funcionamento\n${hours}`);
 
   parts.push(
     `# Estilo\n` +
