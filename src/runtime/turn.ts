@@ -9,6 +9,7 @@ import { parseSpec, type AgentSpec } from "../spec/agent.js";
 import { understandMedia } from "./media.js";
 import { agentKeys } from "../secrets.js";
 import { INTEGRATION_TOOL_NAMES, integrationTools, runIntegrationTool, type IntegrationCtx } from "../integrations/index.js";
+import { parseGaps, recordGaps, type GapDraft } from "../insights/gap-capture.js";
 import { normalizeReply, splitPlainText, typingDelayMs, type ReplyMessage } from "./output.js";
 import { buildSystemPrompt, contextBlock } from "./prompt.js";
 import { builtinTools, formatResults, RefRegistry, REPLY_TOOL } from "./tools.js";
@@ -20,6 +21,24 @@ import { builtinTools, formatResults, RefRegistry, REPLY_TOOL } from "./tools.js
  */
 
 const MAX_ROUNDS = 6;
+/**
+ * O lead escreveu de novo enquanto o agente pensava: a resposta é descartada e
+ * a próxima vez responde tudo junto — até a primeira mensagem esperar isto
+ * (depois, responde mesmo assim para o lead não ficar sem resposta).
+ */
+const SUPERSEDE_MAX_MS = 90_000;
+
+/** Ferramentas sem efeito fora da conversa: a resposta pode ser descartada e refeita. */
+const SAFE_TO_REDO = new Set([REPLY_TOOL, "buscar_conhecimento", "registrar_dados_do_contato", "transferir_para_humano", "agenda_horarios_livres"]);
+
+/** Chegou mensagem do lead depois das que esta vez está respondendo? */
+async function newerLeadMessage(conversationId: string, afterId: string): Promise<boolean> {
+  const [m] = await db()`
+    select 1 from public.messages
+    where conversation_id = ${conversationId} and role = 'user' and turn_id is null and id > ${afterId}
+    limit 1`;
+  return !!m;
+}
 
 export type ConversationRow = {
   id: string;
@@ -43,6 +62,7 @@ type MessageRow = {
   content_type: string;
   media: { url?: string; description?: string; processed?: boolean; error?: string } | null;
   turn_id: string | null;
+  created_at: Date;
 };
 
 export type TurnOptions = {
@@ -55,6 +75,8 @@ export type TurnOptions = {
 export type TurnResult = {
   turnId: string | null;
   status: "done" | "silent" | "error" | "skipped";
+  /** O lead escreveu de novo antes do envio: a próxima vez responde tudo junto. */
+  superseded?: boolean;
   messages: ReplyMessage[];
   attachments: Record<string, { url: string; mime: string; title: string }>;
   silentReason?: string;
@@ -130,7 +152,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
 
   // Mensagens do lead ainda sem resposta.
   const pending = await sql<MessageRow[]>`
-    select id, role, content, content_type, media, turn_id from public.messages
+    select id, role, content, content_type, media, turn_id, created_at from public.messages
     where conversation_id = ${conv.id} and role = 'user' and turn_id is null
     order by id`;
   if (!pending.length) return { turnId: null, status: "skipped", messages: [], attachments: {} };
@@ -202,6 +224,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
     let reply: ReplyMessage[] | null = null;
     let silentReason: string | undefined;
     let handoff: string | undefined;
+    let gaps: GapDraft[] = [];
     let rounds = 0;
     let usedModel = model;
 
@@ -245,6 +268,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
           case REPLY_TOOL: {
             reply = normalizeReply(args.mensagens, spec);
             if (!reply.length) silentReason = typeof args.motivo_silencio === "string" ? args.motivo_silencio : "sem motivo";
+            gaps = parseGaps(args.lacunas);
             result = "ok";
             break;
           }
@@ -287,6 +311,28 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
     timings.llm = Date.now() - tm;
     reply ??= [];
 
+    // O lead mandou mais enquanto o agente pensava: descarta esta resposta (fica
+    // no rastro, com o custo) e a próxima vez responde a tudo de uma vez.
+    const lastPendingId = pending[pending.length - 1]!.id;
+    // Se já marcou reunião, moveu oportunidade etc., não refaz (repetiria a ação): envia.
+    const redoable = toolLog.every((t) => SAFE_TO_REDO.has(t.name));
+    if (
+      live &&
+      redoable &&
+      Date.now() - pending[0]!.created_at.getTime() < SUPERSEDE_MAX_MS &&
+      (await newerLeadMessage(conv.id, lastPendingId))
+    ) {
+      timings.total = Date.now() - t0;
+      await sql`
+        insert into public.turns (id, conversation_id, agent_id, agent_version, simulation, status, input_message_ids, model, rounds,
+                                  tokens_in, tokens_out, tokens_cached, cost_usd, timings, tools, retrieved, output)
+        values (${turnId}, ${conv.id}, ${conv.agent_id}, ${version}, false, 'skipped', ${pending.map((m) => m.id)}::bigint[], ${usedModel}, ${rounds},
+                ${usage.tokensIn}, ${usage.tokensOut}, ${usage.tokensCached}, ${usage.costUsd}, ${sql.json(timings as never)},
+                ${sql.json(toolLog as never)}, ${sql.json(retrievedLog as never)},
+                ${sql.json({ messages: reply, superseded: true, silent_reason: "o lead mandou outra mensagem antes do envio", handoff: null } as never)})`;
+      return { turnId, status: "skipped", superseded: true, messages: [], attachments: {} };
+    }
+
     // 6. Mídias citadas → anexos
     const attachments: TurnResult["attachments"] = {};
     for (const m of reply) {
@@ -308,11 +354,17 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
     tm = Date.now();
     let sent = 0;
     let sendError: string | undefined;
+    let interrupted = false;
     if (live) {
       try {
         for (let i = 0; i < reply.length; i++) {
           const m = reply[i]!;
           if (i > 0 && spec.output.typing_delay) await new Promise((r) => setTimeout(r, typingDelayMs(m.text)));
+          // Como uma pessoa: o lead escreveu no meio, para de mandar o resto e lê.
+          if (i > 0 && (await newerLeadMessage(conv.id, lastPendingId))) {
+            interrupted = true;
+            break;
+          }
           await sendMessage({
             companyId: conv.company_id,
             userId: conv.mavi_user_id,
@@ -329,6 +381,8 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
         // Parte saiu: registra só o que foi enviado para não repetir depois.
         reply = reply.slice(0, sent);
       }
+      // Interrompida pelo lead: fica registrado só o que saiu (a próxima vez continua dali).
+      if (interrupted) reply = reply.slice(0, sent);
       if (handoff) {
         const [b] = await sql<{ inbox_id: string }[]>`select inbox_id from public.bindings where id = ${conv.binding_id}`;
         if (b) await handOffToHuman({ conversationId: conv.external_id, inboxId: b.inbox_id, reason: handoff });
@@ -357,9 +411,16 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
         values (${turnId}, ${conv.id}, ${conv.agent_id}, ${version}, ${conv.simulation}, ${status}, ${pending.map((m) => m.id)}::bigint[], ${usedModel}, ${rounds},
                 ${usage.tokensIn}, ${usage.tokensOut}, ${usage.tokensCached}, ${usage.costUsd}, ${tx.json(timings as never)},
                 ${tx.json(toolLog as never)}, ${tx.json(retrievedLog as never)},
-                ${tx.json({ messages: reply, silent_reason: silentReason ?? null, handoff: handoff ?? null } as never)},
+                ${tx.json({ messages: reply, silent_reason: silentReason ?? null, handoff: handoff ?? null, gaps, ...(interrupted ? { interrupted: true } : {}) } as never)},
                 ${sendError ? `Envio parcial: ${sendError}`.slice(0, 2000) : null})`;
     });
+
+    // Lacunas do treinamento (só nas conversas reais; as simulações ficam no rastro).
+    if (live && gaps.length) {
+      await recordGaps({ agentId: conv.agent_id, conversationId: conv.id, turnId, leadText: pendingText, gaps }).catch((e) =>
+        log.warn({ err: String(e) }, "turn: lacunas não gravadas"),
+      );
+    }
 
     // A régua de follow-up começa a contar a partir desta resposta (sem resposta ou passando para a equipe: não).
     const fu = spec.followup;

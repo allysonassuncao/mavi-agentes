@@ -57,6 +57,8 @@ const UpdateAgent = z.object({
   name: z.string().trim().min(1).max(120).optional(),
   status: z.enum(["active", "paused"]).optional(),
   external_ref: z.record(z.string(), z.unknown()).optional(),
+  /** Quanto das conversas a MAVI lê para os insights (vale na hora, sem publicar). */
+  insights_sample_percent: z.number().int().min(0).max(100).optional(),
 });
 
 const Draft = z.object({
@@ -116,7 +118,7 @@ export async function agentRoutes(app: FastifyInstance) {
     const scope = req.client?.company_scope ?? null;
     const rows = await db()<(AgentRow & { bindings: number })[]>`
       select a.id, a.company_id, a.name, a.origin, a.external_ref, a.status, a.published_version,
-             a.draft_updated_at, a.created_at, a.updated_at,
+             a.draft_updated_at, a.draft_updated_by, a.insights_sample_percent, a.created_at, a.updated_at,
              (select count(*)::int from public.bindings b where b.agent_id = a.id and b.removed_at is null) as bindings
       from public.agents a
       where a.archived_at is null
@@ -159,6 +161,7 @@ export async function agentRoutes(app: FastifyInstance) {
         name = coalesce(${body.name ?? null}, name),
         status = coalesce(${body.status ?? null}, status),
         external_ref = coalesce(${body.external_ref ? db().json(body.external_ref as never) : null}::jsonb, external_ref),
+        insights_sample_percent = coalesce(${body.insights_sample_percent ?? null}::int, insights_sample_percent),
         updated_at = now()
       where id = ${a.id} returning *`;
     return { agent: row };

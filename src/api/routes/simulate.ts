@@ -85,7 +85,9 @@ export async function simulateRoutes(app: FastifyInstance) {
     const turns = await db()`
       select t.id, t.conversation_id, c.external_id, c.contact_name, c.phone, t.agent_version, t.simulation, t.status, t.model,
              t.rounds, t.tokens_in, t.tokens_out, t.tokens_cached, t.cost_usd, t.timings, t.error, t.created_at,
-             t.output->'messages' as messages
+             t.output->'messages' as messages,
+             coalesce((t.output->>'superseded')::boolean, false) as superseded,
+             coalesce((t.output->>'interrupted')::boolean, false) as interrupted
       from public.turns t join public.conversations c on c.id = t.conversation_id
       where t.agent_id = ${a.id}
         and (${sim}::boolean is null or t.simulation = ${sim})

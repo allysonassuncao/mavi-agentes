@@ -119,6 +119,26 @@ sua pelo servidor, nunca pelo navegador.
   multipart · `GET` lista · `DELETE` · `POST /v1/agents/:id/knowledge/search` (teste)
 - `POST /v1/agents/:id/simulate` (rascunho ou versão; não envia nada)
 - `GET /v1/agents/:id/turns` · `GET /v1/turns/:id` · `GET /v1/agents/:id/usage` · `GET /v1/agents/:id/conversations` · `GET /v1/agents/:id/conversations/:cid/messages`
+- `GET /v1/agents/:id/gaps` · `GET|PATCH /v1/agents/:id/gap-topics/:tid` · `POST …/suggest|apply|merge`
+- `GET /v1/agents/:id/report` · `POST /v1/agents/:id/reading` · `GET /v1/agents/:id/insights/conversations` · `GET /v1/agents/:id/conversations/:cid/insight`
+
+## Lacunas e insights
+
+- **Lacunas:** na mesma chamada da resposta, o agente avisa (campo `lacunas` da
+  ferramenta `responder`) perguntas/objeções que o treinamento não cobre. Só nas
+  conversas reais (`gaps`). A cada 2 min o worker agrupa as novas em temas pelo
+  vetor (`gap_topics`, parecido ≥ 0,8; com 3+ ocorrências a MAVI dá o título).
+  A MAVI sugere a resposta (conhecimento + perfil + como a equipe respondeu no
+  MakeCRM) e, aplicada, ela entra como pergunta frequente; o tema fica
+  "treinado" e conta se voltar a aparecer. Cobertura = respostas sem lacuna.
+- **Insights:** cada conversa da amostra (`agents.insights_sample_percent`,
+  fixa por conversa: hash do id) é lida 3 h depois de esfriar
+  (`conversation_insights`: resultado, motivo, objeções, sentimento, falhas).
+  O relatório junta números exatos (mensagens, rastros, reuniões, follow-up,
+  custo) com a amostra, sempre contra o período anterior; a Leitura da MAVI
+  (`agent_readings`) cita as conversas que sustentam cada ponto.
+- O resumo semanal na Caixa de entrada fica no MAVI Tasks (quem recebe e o
+  envio); o motor só dá o relatório e a Leitura.
 
 ## Fases
 

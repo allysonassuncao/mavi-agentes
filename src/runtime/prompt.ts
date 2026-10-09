@@ -136,6 +136,7 @@ export function buildSystemPrompt(spec: AgentSpec): string {
             ]
           : []),
         "Se não houver nada a dizer (por exemplo, o lead só agradeceu depois de a conversa terminar), chame responder com `mensagens` vazio e explique em `motivo_silencio`.",
+        "Se o lead perguntou algo ou fez uma objeção que estas instruções e o conhecimento não cobrem, registre em `lacunas` (o lead não vê). Responda mesmo assim do melhor jeito, sem inventar dados.",
       ]),
   );
 

@@ -33,6 +33,24 @@ export function builtinTools(spec: AgentSpec): ToolDef[] {
               },
             },
             motivo_silencio: { type: "string", description: "Só quando `mensagens` estiver vazio: por que não responder." },
+            lacunas: {
+              type: "array",
+              maxItems: 3,
+              description:
+                "Perguntas ou objeções do lead NESTA vez que as suas instruções e o conhecimento não cobrem (você não achou a resposta, improvisou ou desviou). Não inclua o que respondeu com base no conhecimento. O lead não vê isto.",
+              items: {
+                type: "object",
+                properties: {
+                  tipo: { type: "string", enum: ["pergunta", "objecao"] },
+                  texto: { type: "string", description: "A pergunta ou objeção em uma frase curta e genérica, sem nomes nem dados do lead (ex.: \"Aceita pagamento no boleto?\")." },
+                  categoria: {
+                    type: "string",
+                    description: "Só para objeção: preco, prazo, confianca, concorrente, momento, decisor, necessidade ou outro.",
+                  },
+                },
+                required: ["tipo", "texto"],
+              },
+            },
           },
           required: ["mensagens"],
         },

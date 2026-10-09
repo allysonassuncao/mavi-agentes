@@ -6,6 +6,8 @@ import { log } from "./log.js";
 import { QUEUE, scheduleFollowup, scheduleTurn, type FollowupJob, type KnowledgeJob, type TurnJob } from "./queue.js";
 import { db } from "./db.js";
 import { processFollowup } from "./runtime/followup.js";
+import { analyzeDue } from "./insights/analyze.js";
+import { clusterGaps } from "./insights/gaps.js";
 import { redis, redisConnection } from "./redis.js";
 import { lastMessageKey } from "./api/routes/inbound.js";
 import { runTurn } from "./runtime/turn.js";
@@ -62,6 +64,22 @@ async function followupTick() {
   for (const c of due) await scheduleFollowup(c.id, c.followup_step, 0, 0, String(c.followup_next_at.getTime()));
 }
 
+/**
+ * A cada 2 minutos, um worker (com trava): as lacunas novas entram nos temas e
+ * as conversas que esfriaram (na amostra de cada agente) são lidas.
+ */
+async function insightsTick() {
+  const ok = await redis().set("ins:tick", "1", "PX", 10 * 60_000, "NX");
+  if (!ok) return;
+  try {
+    const gaps = await clusterGaps().catch((e) => (log.error({ err: String(e) }, "lacunas: agrupamento falhou"), 0));
+    const read = await analyzeDue();
+    if (gaps || read) log.info({ gaps, read }, "insights: rodada");
+  } finally {
+    await redis().del("ins:tick");
+  }
+}
+
 export function startWorkers() {
   const turns = new Worker<TurnJob | FollowupJob>(
     QUEUE.turns,
@@ -79,6 +97,10 @@ export function startWorkers() {
     w.on("error", (err) => log.error({ queue: w.name, err: err.message }, "worker: erro"));
   }
   const tick = setInterval(() => void followupTick().catch((e) => log.error({ err: String(e) }, "follow-up: varredura falhou")), 60_000);
-  turns.on("closing", () => clearInterval(tick));
+  const insights = setInterval(() => void insightsTick().catch((e) => log.error({ err: String(e) }, "insights: rodada falhou")), 2 * 60_000);
+  turns.on("closing", () => {
+    clearInterval(tick);
+    clearInterval(insights);
+  });
   return [turns, knowledge];
 }
