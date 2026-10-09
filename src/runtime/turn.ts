@@ -21,7 +21,7 @@ import { builtinTools, formatResults, RefRegistry, REPLY_TOOL } from "./tools.js
 
 const MAX_ROUNDS = 6;
 
-type ConversationRow = {
+export type ConversationRow = {
   id: string;
   agent_id: string;
   binding_id: string | null;
@@ -82,6 +82,28 @@ export async function publishedSpec(agentId: string): Promise<{ spec: AgentSpec;
     specCache.set(key, spec);
   }
   return { spec, version: row.published_version };
+}
+
+/** O que as integrações e o follow-up precisam saber da conversa. */
+export async function integrationCtx(conv: ConversationRow, spec: AgentSpec): Promise<IntegrationCtx> {
+  const inboxId = conv.binding_id
+    ? ((await db()<{ inbox_id: string }[]>`select inbox_id from public.bindings where id = ${conv.binding_id}`)[0]?.inbox_id ?? null)
+    : null;
+  return {
+    agentId: conv.agent_id,
+    agentName: spec.persona.name,
+    spec,
+    simulation: conv.simulation,
+    conversationId: conv.id,
+    makecrmConversationId: conv.simulation ? null : conv.external_id,
+    inboxId,
+    companyId: conv.company_id,
+    maviUserId: conv.mavi_user_id,
+    contactName: conv.contact_name,
+    phone: conv.phone,
+    facts: conv.facts,
+    summary: conv.summary,
+  };
 }
 
 // ---------------------------------------------------------------- a vez
@@ -176,24 +198,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
     tm = Date.now();
     const tools = [...builtinTools(spec), ...integrationTools(spec)];
     // O que as integrações precisam saber da conversa (MakeCRM, contato, resumo).
-    const inboxId = conv.binding_id
-      ? ((await sql<{ inbox_id: string }[]>`select inbox_id from public.bindings where id = ${conv.binding_id}`)[0]?.inbox_id ?? null)
-      : null;
-    const ictx: IntegrationCtx = {
-      agentId: conv.agent_id,
-      agentName: spec.persona.name,
-      spec,
-      simulation: conv.simulation,
-      conversationId: conv.id,
-      makecrmConversationId: conv.simulation ? null : conv.external_id,
-      inboxId,
-      companyId: conv.company_id,
-      maviUserId: conv.mavi_user_id,
-      contactName: conv.contact_name,
-      phone: conv.phone,
-      facts: conv.facts,
-      summary: conv.summary,
-    };
+    const ictx = await integrationCtx(conv, spec);
     let reply: ReplyMessage[] | null = null;
     let silentReason: string | undefined;
     let handoff: string | undefined;
@@ -355,6 +360,17 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
                 ${tx.json({ messages: reply, silent_reason: silentReason ?? null, handoff: handoff ?? null } as never)},
                 ${sendError ? `Envio parcial: ${sendError}`.slice(0, 2000) : null})`;
     });
+
+    // A régua de follow-up começa a contar a partir desta resposta (sem resposta ou passando para a equipe: não).
+    const fu = spec.followup;
+    if (live && status === "done" && !handoff && fu?.enabled && fu.steps.length) {
+      await sql`
+        update public.conversations set followup_step = 0, followup_state = 'active',
+          followup_next_at = now() + make_interval(mins => ${fu.steps[0]!.after_minutes})
+        where id = ${conv.id}`;
+    } else if (live && handoff) {
+      await sql`update public.conversations set followup_next_at = null, followup_state = 'idle' where id = ${conv.id}`;
+    }
 
     // 9. Resumo das mensagens antigas (depois de responder, sem atrasar o lead)
     if (spec.memory.summary) await maybeSummarize(conv, spec).catch((e) => log.warn({ err: String(e) }, "turn: resumo falhou"));

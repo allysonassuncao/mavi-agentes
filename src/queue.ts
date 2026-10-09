@@ -4,13 +4,14 @@ import { redisConnection } from "./redis.js";
 export const QUEUE = { turns: "turns", knowledge: "knowledge" } as const;
 
 export type TurnJob = { conversationId: string; messageId: string; attempt?: number };
+export type FollowupJob = { conversationId: string; step: number; attempt?: number };
 export type KnowledgeJob = { itemId: string };
 
-let turns: Queue<TurnJob> | null = null;
+let turns: Queue<TurnJob | FollowupJob> | null = null;
 let knowledge: Queue<KnowledgeJob> | null = null;
 
 export function turnsQueue() {
-  turns ??= new Queue<TurnJob>(QUEUE.turns, { connection: redisConnection() });
+  turns ??= new Queue<TurnJob | FollowupJob>(QUEUE.turns, { connection: redisConnection() });
   return turns;
 }
 export function knowledgeQueue() {
@@ -26,6 +27,20 @@ export async function scheduleTurn(conversationId: string, messageId: string, de
     {
       delay: delayMs,
       jobId: `t-${conversationId}-${messageId}-${attempt}`,
+      removeOnComplete: { count: 2000 },
+      removeOnFail: { count: 5000 },
+    },
+  );
+}
+
+/** Uma etapa da régua de follow-up (na mesma fila das respostas: uma coisa por vez por conversa). */
+export async function scheduleFollowup(conversationId: string, step: number, delayMs = 0, attempt = 0, key = "") {
+  await turnsQueue().add(
+    "followup",
+    { conversationId, step, attempt },
+    {
+      delay: delayMs,
+      jobId: `f-${conversationId}-${step}-${key || attempt}`,
       removeOnComplete: { count: 2000 },
       removeOnFail: { count: 5000 },
     },

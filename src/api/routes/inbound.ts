@@ -56,7 +56,9 @@ export async function inboundRoutes(app: FastifyInstance) {
         phone = coalesce(excluded.phone, public.conversations.phone),
         contact_name = coalesce(excluded.contact_name, public.conversations.contact_name),
         mavi_user_id = coalesce(excluded.mavi_user_id, public.conversations.mavi_user_id),
-        last_inbound_at = now()
+        last_inbound_at = now(),
+        -- O lead respondeu: a régua de follow-up para (recomeça quando ele sumir de novo).
+        followup_step = 0, followup_next_at = null, followup_state = 'idle'
       returning id`;
     const media = msg.mediaUrl ? { url: msg.mediaUrl, ...(msg.referral ? { referral: msg.referral } : {}) } : msg.referral ? { referral: msg.referral } : null;
     const [m] = await sql<{ id: string }[]>`

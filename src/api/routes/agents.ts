@@ -6,7 +6,9 @@ import { db } from "../../db.js";
 import { connectedUsers } from "../../integrations/calendar.js";
 import {
   companyByMakeId,
+  listTemplates,
   rest,
+  templateBody,
   getInbox,
   getInboxWebhook,
   inboxBlockedByLegacyAgent,
@@ -254,6 +256,27 @@ export async function agentRoutes(app: FastifyInstance) {
         )
       : [];
     return { pipelines: pipelines.map((p) => ({ ...p, stages: stages.filter((s) => s.pipeline_id === p.id) })) };
+  });
+
+  /** Modelos aprovados do WhatsApp Business API da empresa (para o follow-up fora da janela de 24h). */
+  app.get("/v1/makecrm/companies/:companyId/templates", async (req) => {
+    const { companyId } = req.params as { companyId: string };
+    if (!canCompany(req, companyId)) throw new HttpError(403, "Sem acesso a esta empresa.");
+    const list = await listTemplates(companyId);
+    return {
+      templates: list.map((t) => {
+        const b = templateBody(t.content);
+        return {
+          template_id: t.template_id,
+          name: t.name || b.name,
+          category: t.category,
+          language: b.language,
+          text: b.text,
+          params: (b.text.match(/\{\{[^}]+\}\}/g) ?? []).length,
+          examples: b.examples,
+        };
+      }),
+    };
   });
 
   /** Usuários ativos da empresa (sem os de IA) e se têm o Google Agenda conectado no MakeCRM. */

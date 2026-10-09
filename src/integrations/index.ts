@@ -339,19 +339,32 @@ async function cancel(_cfg: GoogleCalendarConfig, args: Record<string, unknown>,
 async function moveDeal(cfg: MoveDealConfig, args: Record<string, unknown>, ctx: IntegrationCtx): Promise<IntegrationResult> {
   const rule = cfg.rules.find((r) => r.id === String(args.regra ?? ""));
   if (!rule) return { result: "Regra desconhecida.", silent: true };
-  const stage = (
-    await rest<{ id: string; name: string; pipeline_id: string }[]>(
-      `pipeline_stages?select=id,name,pipeline_id&id=eq.${rule.stage_id}&pipeline_id=eq.${rule.pipeline_id}&status=eq.true`,
-    )
-  )[0];
-  if (!stage) return { result: "A etapa da regra não existe mais no CRM (avise a equipe para corrigir a regra).", silent: true };
-  if (ctx.simulation) return { result: `Simulação: a oportunidade iria para a etapa "${stage.name}". Siga a conversa sem comentar.`, silent: true };
-  if (!ctx.makecrmConversationId) return { result: "Sem conversa no CRM.", silent: true };
+  if (ctx.simulation) {
+    const stage = await stageOf(rule.pipeline_id, rule.stage_id);
+    return { result: stage ? `Simulação: a oportunidade iria para a etapa "${stage.name}". Siga a conversa sem comentar.` : "A etapa da regra não existe mais no CRM.", silent: true };
+  }
   // Uma vez por regra e conversa a cada hora (o lead pode repetir a mesma coisa).
   const dedup = `mv:${ctx.conversationId}:${rule.id}`;
   if (!(await redis().set(dedup, "1", "EX", 3600, "NX"))) return { result: "Já feito.", silent: true };
+  const r = await moveDealsTo(ctx, rule.pipeline_id, rule.stage_id, args.motivo ? String(args.motivo) : "", cfg.run_automations);
+  return { ...r, silent: true, action: { type: "mover_oportunidade", rule: rule.id } };
+}
+
+async function stageOf(pipelineId: string, stageId: string) {
+  return (
+    await rest<{ id: string; name: string; pipeline_id: string }[]>(
+      `pipeline_stages?select=id,name,pipeline_id&id=eq.${stageId}&pipeline_id=eq.${pipelineId}&status=eq.true`,
+    )
+  )[0];
+}
+
+/** Move as oportunidades ativas da conversa para a etapa (histórico, log e automações do MakeCRM). */
+export async function moveDealsTo(ctx: IntegrationCtx, pipelineId: string, stageId: string, reason: string, runAutomations: boolean): Promise<IntegrationResult> {
+  const stage = await stageOf(pipelineId, stageId);
+  if (!stage) return { result: "A etapa não existe mais no CRM (avise a equipe para corrigir a configuração)." };
+  if (!ctx.makecrmConversationId) return { result: "Sem conversa no CRM." };
   const deals = await activeDeals(ctx.makecrmConversationId);
-  if (!deals.length) return { result: "O lead não tem oportunidade ativa: nada a mover. Siga a conversa.", silent: true };
+  if (!deals.length) return { result: "O lead não tem oportunidade ativa: nada a mover. Siga a conversa." };
   const stageNames = new Map(
     (await rest<{ id: string; name: string }[]>(`pipeline_stages?select=id,name&id=in.(${[...new Set(deals.map((d) => d.stage_id))].join(",")})`)).map((s) => [s.id, s.name]),
   );
@@ -363,13 +376,13 @@ async function moveDeal(cfg: MoveDealConfig, args: Record<string, unknown>, ctx:
       headers: { prefer: "return=minimal" },
       body: JSON.stringify({ pipeline_id: stage.pipeline_id, stage_id: stage.id, updated_at: new Date().toISOString() }),
     });
-    await addStory(d.id, ctx.maviUserId, `A oportunidade foi movida de "${stageNames.get(d.stage_id) ?? "?"}" para "${stage.name}" pela MAVI${args.motivo ? ` (${String(args.motivo).slice(0, 200)})` : ""}.`).catch(() => {});
+    await addStory(d.id, ctx.maviUserId, `A oportunidade foi movida de "${stageNames.get(d.stage_id) ?? "?"}" para "${stage.name}" pela MAVI${reason ? ` (${reason.slice(0, 200)})` : ""}.`).catch(() => {});
     await rest("pipeline_deal_stage_logs", {
       method: "POST",
       headers: { prefer: "return=minimal" },
       body: JSON.stringify({ deal_id: d.id, stage_id: stage.id, user_id: ctx.maviUserId }),
     }).catch(() => {});
-    if (cfg.run_automations && config().MAKECRM_AUTOMATIONS_URL)
+    if (runAutomations && config().MAKECRM_AUTOMATIONS_URL)
       await fetch(config().MAKECRM_AUTOMATIONS_URL, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -386,7 +399,7 @@ async function moveDeal(cfg: MoveDealConfig, args: Record<string, unknown>, ctx:
       }).catch((e) => log.warn({ err: String(e) }, "mover: automações do MakeCRM não responderam"));
     moved++;
   }
-  return { result: moved ? "Feito. Siga a conversa sem comentar a mudança." : "Já estava nessa etapa.", silent: true, action: { type: "mover_oportunidade", rule: rule.id, deals: deals.map((d) => d.id) } };
+  return { result: moved ? "Feito. Siga a conversa sem comentar a mudança." : "Já estava nessa etapa." };
 }
 
 const ROLE_COL = { owner: "user_id", sdr: "sdr_id", closer: "closer_id" } as const;
@@ -450,12 +463,17 @@ async function notifyTeam(cfg: TeamNotifyConfig, args: Record<string, unknown>, 
   if (ctx.simulation) return { result: `Simulação: a equipe receberia: "${message}".`, silent: true };
   const dedup = `nt:${ctx.conversationId}:${message.slice(0, 80)}`;
   if (!(await redis().set(dedup, "1", "EX", 300, "NX"))) return { result: "Já avisado.", silent: true };
+  return { ...(await sendTeamNotice(cfg, message, ctx)), silent: true };
+}
+
+/** O aviso pelo WhatsApp da caixa configurada (Uazapi). */
+export async function sendTeamNotice(cfg: TeamNotifyConfig, message: string, ctx: IntegrationCtx): Promise<IntegrationResult> {
   const [inbox] = await rest<{ settings_id: number | null }[]>(`inboxes?select=settings_id&id=eq.${cfg.inbox_id}`);
   const [settings] = inbox?.settings_id
     ? await rest<{ settings: { provider?: string; schema?: { base_url?: string; token?: string } } }[]>(`inbox_settings?select=settings&id=eq.${inbox.settings_id}`)
     : [];
   const schema = settings?.settings?.schema;
-  if (!schema?.base_url || !schema.token) return { result: "A caixa do aviso não é de WhatsApp por QR Code (Uazapi). Avise a equipe para corrigir.", silent: true };
+  if (!schema?.base_url || !schema.token) return { result: "A caixa do aviso não é de WhatsApp por QR Code (Uazapi). Avise a equipe para corrigir." };
   const phone = ctx.phone ? `${ctx.phone.slice(0, -4).replace(/\d/g, "•")}${ctx.phone.slice(-4)}` : "";
   const link = ctx.makecrmConversationId && ctx.inboxId ? `https://app.usemakecrm.com.br/conversations/${ctx.inboxId}?chatId=${ctx.makecrmConversationId}` : "";
   const text = `🤖 ${ctx.agentName}\n${message}\n\nContato: ${ctx.contactName ?? "—"}${phone ? ` (${phone})` : ""}${link ? `\n${link}` : ""}`;
@@ -467,5 +485,5 @@ async function notifyTeam(cfg: TeamNotifyConfig, args: Record<string, unknown>, 
       signal: AbortSignal.timeout(15_000),
     }).catch((e) => log.warn({ err: String(e) }, "aviso: envio falhou"));
   }
-  return { result: "Equipe avisada. Siga a conversa sem comentar.", silent: true };
+  return { result: "Equipe avisada. Siga a conversa sem comentar." };
 }

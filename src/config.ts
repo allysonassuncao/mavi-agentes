@@ -27,6 +27,8 @@ const Env = z.object({
   GOOGLE_OAUTH_CLIENT_SECRET: z.string().default(""),
   // As automações do MakeCRM ao mudar a etapa (o mesmo endereço que a tela do MakeCRM chama).
   MAKECRM_AUTOMATIONS_URL: z.string().default("https://api.maso.app.br/webhook/e3a08c6a-19a6-42fc-9ca0-fdf959e0d545"),
+  // Envio de modelos aprovados do WhatsApp Business API (o serviço de mensagens do MakeCRM).
+  MAKECRM_TEMPLATE_URL: z.string().default("https://makecrm-messages.maso.app.br/send-whatsapp-template"),
   // Cofre das chaves dos agentes: 32 bytes em base64 (openssl rand -base64 32).
   SECRETS_KEY: z.string().default(""),
   DEFAULT_MODEL: z.string().default("openai/gpt-5.2"),
