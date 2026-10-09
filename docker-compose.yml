@@ -1,0 +1,56 @@
+# Produção: api + worker + Redis. Segredos no arquivo .env (fora do git).
+#   docker compose up -d --build
+# O Traefik do servidor publica a api em agentes.maso.app.br (ajuste a rede).
+services:
+  api:
+    build: .
+    image: mavi-agentes:latest
+    command: ["node", "dist/main-api.js"]
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on: [redis]
+    restart: always
+    networks: [interna, proxy]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${PROXY_NETWORK:-allyson-desenv}
+      - traefik.http.routers.mavi-agentes.rule=Host(`${PUBLIC_HOST:-agentes.maso.app.br}`)
+      - traefik.http.routers.mavi-agentes.entrypoints=websecure
+      - traefik.http.routers.mavi-agentes.tls.certresolver=letsencryptresolver
+      - traefik.http.services.mavi-agentes.loadbalancer.server.port=8080
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "5" } }
+
+  worker:
+    image: mavi-agentes:latest
+    command: ["node", "dist/main-worker.js"]
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on: [redis, api]
+    restart: always
+    networks: [interna]
+    # Mais capacidade: aumente as réplicas (cada uma com WORKER_CONCURRENCY respostas ao mesmo tempo).
+    deploy: { replicas: 2 }
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "5" } }
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes: [redis-data:/data]
+    restart: always
+    networks: [interna]
+
+volumes:
+  redis-data:
+
+networks:
+  interna:
+  proxy:
+    external: true
+    name: ${PROXY_NETWORK:-allyson-desenv}
