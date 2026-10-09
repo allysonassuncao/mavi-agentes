@@ -62,3 +62,35 @@ export async function signedUrl(path: string, expiresIn = 7 * 24 * 3600): Promis
   if (!j.signedURL) throw new Error("Storage: link assinado vazio.");
   return `${base()}${j.signedURL}`;
 }
+
+/**
+ * Link para o navegador enviar o arquivo direto ao Storage (sem passar pelo
+ * MAVI Tasks, que tem limite de 4,5 MB por requisição na Vercel). Vale 2 h.
+ */
+export async function signedUploadUrl(path: string): Promise<string> {
+  await ensureBucket();
+  const res = await fetch(`${base()}/object/upload/sign/${config().KNOWLEDGE_BUCKET}/${encodePath(path)}`, {
+    method: "POST",
+    headers: headers({ "content-type": "application/json" }),
+    body: "{}",
+  });
+  if (!res.ok) throw new Error(`Storage: falha ao criar link de envio (${res.status}): ${(await res.text()).slice(0, 200)}`);
+  const j = (await res.json()) as { url?: string };
+  if (!j.url) throw new Error("Storage: link de envio vazio.");
+  return `${base()}${j.url}`;
+}
+
+/** O arquivo existe no Storage? (e o tamanho). */
+export async function objectInfo(path: string): Promise<{ size: number } | null> {
+  const dir = path.split("/").slice(0, -1).join("/");
+  const name = path.split("/").pop() ?? "";
+  const res = await fetch(`${base()}/object/list/${config().KNOWLEDGE_BUCKET}`, {
+    method: "POST",
+    headers: headers({ "content-type": "application/json" }),
+    body: JSON.stringify({ prefix: dir, search: name, limit: 10 }),
+  });
+  if (!res.ok) return null;
+  const list = (await res.json()) as { name: string; metadata?: { size?: number } }[];
+  const hit = list.find((o) => o.name === name);
+  return hit ? { size: hit.metadata?.size ?? 0 } : null;
+}

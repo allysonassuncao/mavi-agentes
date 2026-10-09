@@ -4,7 +4,7 @@ import { z } from "zod";
 import { db } from "../../db.js";
 import { kindOf } from "../../knowledge/extract.js";
 import { searchKnowledge } from "../../knowledge/search.js";
-import { putObject, removeObjects } from "../../knowledge/storage.js";
+import { objectInfo, putObject, removeObjects, signedUploadUrl } from "../../knowledge/storage.js";
 import { scheduleIngest } from "../../queue.js";
 import { canCompany } from "../auth.js";
 import { assertUuid, HttpError, notFound, parseBody } from "../http.js";
@@ -31,6 +31,9 @@ const NewItem = z
     if (v.kind === "document") need(!!v.url || !!v.body.trim(), "Documento precisa de url ou texto (para arquivo, use /knowledge/upload).");
     if (v.kind === "text" || v.kind === "example") need(!!v.body.trim(), "Texto vazio.");
   });
+
+const safeFileName = (name: string) =>
+  name.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^\w.\-]+/g, "_").slice(-120) || "arquivo";
 
 const ITEM_COLUMNS = "id, kind, title, left(body, 400) as body_preview, length(body) as body_length, data, source, status, error, chunk_count, created_by, created_at, updated_at";
 
@@ -120,8 +123,7 @@ export async function knowledgeRoutes(app: FastifyInstance) {
     if (kind === "media" && !description) throw new HttpError(400, "Mídia precisa de descrição (é por ela que o agente encontra a mídia).");
 
     const id = randomUUID();
-    const safeName = file.filename.replace(/[^\w.\-]+/g, "_").slice(-120) || "arquivo";
-    const path = `${a.id}/${id}/${safeName}`;
+    const path = `${a.id}/${id}/${safeFileName(file.filename)}`;
     await putObject(path, bytes, mime);
     const source = { type: "upload", filename: file.filename, mime, size: bytes.length, storage_path: path };
     const data =
@@ -134,6 +136,60 @@ export async function knowledgeRoutes(app: FastifyInstance) {
               ${db().json(data as never)}, ${db().json(source as never)}, ${field("created_by") || req.client!.name})`;
     await scheduleIngest(id);
     return reply.code(201).send({ id });
+  });
+
+  /**
+   * Envio direto do navegador: 1) pede o link (upload-url), 2) envia o arquivo
+   * com PUT nesse link, 3) avisa que terminou (uploaded).
+   */
+  app.post("/v1/agents/:id/knowledge/upload-url", async (req) => {
+    const a = await loadAgent(req, (req.params as { id: string }).id);
+    const body = parseBody(
+      z.object({
+        kind: z.enum(["document", "media"]),
+        filename: z.string().trim().min(1).max(200),
+        mime: z.string().max(120).default("application/octet-stream"),
+        size: z.number().int().min(1).max(50 * 1024 * 1024),
+      }),
+      req.body,
+    );
+    if (body.kind === "document" && !kindOf(body.mime, body.filename)) throw new HttpError(415, "Tipo de documento não suportado (PDF, DOCX, TXT, MD, CSV, HTML).");
+    if (body.kind === "media" && !/^(image|video|audio)\//.test(body.mime) && body.mime !== "application/pdf") {
+      throw new HttpError(415, "Mídia deve ser imagem, vídeo, áudio ou PDF.");
+    }
+    const itemId = randomUUID();
+    const storagePath = `${a.id}/${itemId}/${safeFileName(body.filename)}`;
+    return { item_id: itemId, storage_path: storagePath, upload_url: await signedUploadUrl(storagePath) };
+  });
+
+  app.post("/v1/agents/:id/knowledge/uploaded", async (req, reply) => {
+    const a = await loadAgent(req, (req.params as { id: string }).id);
+    const body = parseBody(
+      z.object({
+        item_id: z.string().uuid(),
+        storage_path: z.string().min(1).max(400),
+        kind: z.enum(["document", "media"]),
+        filename: z.string().trim().min(1).max(200),
+        mime: z.string().max(120).default("application/octet-stream"),
+        title: z.string().trim().max(300).default(""),
+        description: z.string().trim().max(4000).default(""),
+        created_by: z.string().max(200).optional(),
+      }),
+      req.body,
+    );
+    if (!body.storage_path.startsWith(`${a.id}/${body.item_id}/`)) throw new HttpError(400, "Caminho do arquivo inválido.");
+    if (body.kind === "media" && !body.description) throw new HttpError(400, "Mídia precisa de descrição (é por ela que o agente encontra a mídia).");
+    const info = await objectInfo(body.storage_path);
+    if (!info) throw new HttpError(400, "O arquivo não chegou ao armazenamento. Envie de novo.");
+    const source = { type: "upload", filename: body.filename, mime: body.mime, size: info.size, storage_path: body.storage_path };
+    const data = body.kind === "media" ? { storage_path: body.storage_path, mime: body.mime, media_kind: body.mime.split("/")[0], description: body.description } : {};
+    await db()`
+      insert into public.knowledge_items (id, agent_id, kind, title, body, data, source, created_by)
+      values (${body.item_id}, ${a.id}, ${body.kind}, ${body.title || body.filename}, ${body.kind === "media" ? body.description : ""},
+              ${db().json(data as never)}, ${db().json(source as never)}, ${body.created_by ?? req.client!.name})
+      on conflict (id) do nothing`;
+    await scheduleIngest(body.item_id);
+    return reply.code(201).send({ id: body.item_id });
   });
 
   app.get("/v1/knowledge/:itemId", async (req) => {
