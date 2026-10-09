@@ -146,6 +146,65 @@ export async function simulateRoutes(app: FastifyInstance) {
   });
 
   /**
+   * Os leads do agente (um por telefone; sem telefone, um por conversa), do
+   * mais recente para o mais antigo, com a última mensagem, contagens, erros e
+   * custo. Um lead pode ter mais de uma conversa (caixas diferentes): vêm as
+   * conversas dele. Página por "before" (o last_at do último da página).
+   */
+  app.get("/v1/agents/:id/leads", async (req) => {
+    const a = await loadAgent(req, (req.params as { id: string }).id);
+    const q = req.query as { limit?: string; q?: string; before?: string; errors?: string };
+    const limit = Math.min(Math.max(Number(q.limit) || 50, 1), 100);
+    const term = String(q.q ?? "").trim().slice(0, 80);
+    const digits = term.replace(/\D/g, "");
+    const like = term ? `%${term.replace(/[%_\\]/g, (c) => `\\${c}`)}%` : null;
+    const before = q.before && !Number.isNaN(Date.parse(q.before)) ? new Date(q.before) : null;
+    const onlyErrors = q.errors === "true";
+    const sql = db();
+    const conv = sql`
+      select c.id, c.phone, c.contact_name, c.created_at,
+             coalesce(nullif(regexp_replace(coalesce(c.phone, ''), '\\D', '', 'g'), ''), 'c:' || c.id::text) as lead_key,
+             greatest(coalesce(c.last_inbound_at, c.created_at), coalesce(c.last_reply_at, c.created_at)) as last_at
+      from public.conversations c
+      where c.agent_id = ${a.id} and not c.simulation
+        and (${like}::text is null or c.contact_name ilike ${like} or (${digits} <> '' and regexp_replace(coalesce(c.phone, ''), '\\D', '', 'g') like ${`%${digits}%`}))
+        and (not ${onlyErrors} or exists (select 1 from public.turns t where t.conversation_id = c.id and t.status = 'error'))`;
+    const rows = await sql`
+      with conv as (${conv}),
+      g as (
+        select lead_key, max(last_at) as last_at, min(created_at) as first_at,
+               array_agg(id order by last_at desc) as ids,
+               jsonb_agg(jsonb_build_object('id', id, 'created_at', created_at, 'last_at', last_at) order by last_at desc) as conversations,
+               (array_agg(contact_name order by last_at desc) filter (where contact_name is not null))[1] as contact_name,
+               (array_agg(phone order by last_at desc) filter (where phone is not null))[1] as phone
+        from conv group by lead_key
+        having ${before}::timestamptz is null or max(last_at) < ${before}::timestamptz
+        order by max(last_at) desc limit ${limit + 1}
+      )
+      select g.lead_key, g.last_at, g.first_at, g.conversations, g.contact_name, g.phone,
+             lm.role as last_role, lm.content as last_content, coalesce(st.messages, 0) as messages,
+             coalesce(t.replies, 0) as replies, coalesce(t.errors, 0) as errors, coalesce(t.cost_usd, 0) as cost_usd
+      from g
+      left join lateral (
+        select m.role, m.content from public.messages m
+        where m.conversation_id = any (g.ids) and m.role in ('user', 'assistant') order by m.id desc limit 1) lm on true
+      left join lateral (
+        select count(*)::int as messages from public.messages m where m.conversation_id = any (g.ids) and m.role in ('user', 'assistant')) st on true
+      left join lateral (
+        select count(*) filter (where t.status = 'done')::int as replies, count(*) filter (where t.status = 'error')::int as errors,
+               sum(t.cost_usd) as cost_usd
+        from public.turns t where t.conversation_id = any (g.ids)) t on true
+      order by g.last_at desc`;
+    const page = rows.slice(0, limit);
+    const [total] = before ? [null] : await sql<{ n: number }[]>`with conv as (${conv}) select count(distinct lead_key)::int as n from conv`;
+    return {
+      leads: page.map((r) => ({ ...r, last_content: r.last_content ? String(r.last_content).slice(0, 300) : null })),
+      next: rows.length > limit ? (page[page.length - 1]!.last_at as Date).toISOString() : null,
+      total: total?.n ?? null,
+    };
+  });
+
+  /**
    * Zera a memória do agente numa conversa: apaga as mensagens que ele guarda
    * (o histórico que relê a cada resposta), o resumo, os dados coletados do
    * contato e a leitura da MAVI; para o follow-up. Rastros e custos ficam
@@ -179,7 +238,7 @@ export async function simulateRoutes(app: FastifyInstance) {
         return m!.n;
       });
       // As travas de "já feito" (cenários, ações na oportunidade, mover): o lead recomeça do zero.
-      for (const prefix of ["sc", "da", "mv"]) {
+      for (const prefix of ["once", "sc", "da", "mv"]) {
         const keys: string[] = [];
         for await (const batch of redis().scanStream({ match: `${prefix}:${cid}:*`, count: 200 })) keys.push(...(batch as string[]));
         if (keys.length) await redis().del(...keys);

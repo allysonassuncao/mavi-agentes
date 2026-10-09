@@ -37,6 +37,7 @@ import { WeeklyHours } from "./weekly-hours.js";
 import { Integration } from "./integrations.js";
 import { Followup } from "./followup.js";
 import { Scenarios } from "./scenarios.js";
+import { MeetingReminders } from "./reminders.js";
 
 export const Instructions = z
   .object({
@@ -157,6 +158,8 @@ export const AgentSpec = z
     scenarios: Scenarios,
     /** Régua de follow-up quando o lead para de responder. */
     followup: Followup.nullable().default(null),
+    /** Régua de pré-reunião: mensagens antes e depois das reuniões marcadas pelo agente. */
+    meeting_reminders: MeetingReminders.nullable().default(null),
     tools: z.array(ToolRef).max(40).default([]),
     automations: z.array(z.record(z.string(), z.unknown())).max(40).default([]),
   })

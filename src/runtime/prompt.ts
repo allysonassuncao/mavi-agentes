@@ -177,12 +177,15 @@ export function contextBlock(input: {
   facts: Record<string, unknown>;
   summary: string;
   retrieved: RetrievedForPrompt[];
+  /** A reunião marcada pelo agente com este lead (data, link, confirmação). */
+  meeting?: string | null;
 }): string {
   const lines: string[] = [`Agora: ${nowInBrazil(input.now)}`];
   const who = [input.contactName && `nome no WhatsApp: ${input.contactName}`, input.phone && `telefone: ${input.phone}`].filter(Boolean);
   if (who.length) lines.push(`Contato: ${who.join(", ")}`);
   const facts = Object.entries(input.facts).filter(([, v]) => v !== null && v !== "");
   if (facts.length) lines.push(`Dados já registrados do contato: ${facts.map(([k, v]) => `${k}: ${String(v)}`).join("; ")}`);
+  if (input.meeting) lines.push(`Reunião marcada com este lead: ${input.meeting}`);
   if (input.summary.trim()) lines.push(`Resumo das mensagens anteriores:\n${input.summary.trim()}`);
   if (input.retrieved.length) {
     lines.push(

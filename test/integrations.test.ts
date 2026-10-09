@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { freeSlots, parseWhen, spreadSlots, withinAllowed } from "../src/integrations/calendar.js";
+import { explainDays, freeSlots, parseWhen, spreadSlots, withinAllowed } from "../src/integrations/calendar.js";
 import { spLabel } from "../src/integrations/time.js";
 import { emailList, emailTypos, integrationTools } from "../src/integrations/index.js";
 import { integrationsPrompt } from "../src/integrations/prompt.js";
@@ -41,6 +41,25 @@ describe("horários livres", () => {
     expect(withinAllowed(cfg, d, new Date(d.getTime() + 30 * 60_000))).toBe(true);
     expect(withinAllowed(cfg, parseWhen("2026-10-14 10:00")!, parseWhen("2026-10-14 10:30")!)).toBe(false);
     expect(parseWhen("amanhã")).toBeNull();
+  });
+});
+
+describe("diagnóstico da agenda (Registro técnico)", () => {
+  it("o caso do feriado: sábado e domingo fechados, segunda ocupada o dia todo, sexta sem tempo", () => {
+    const week5 = Object.fromEntries(["mon", "tue", "wed", "thu", "fri"].map((d) => [d, { from: "09:00", to: "18:00" }]));
+    const c = { allowed_hours: week5, duration_minutes: 30, min_notice_minutes: 60, slot_step_minutes: 30 as const };
+    // Sexta 09/10/2026 às 17:00 em Brasília; segunda 12/10 ocupada das 09:00 às 18:00.
+    const now = new Date("2026-10-09T20:00:00Z");
+    const busy = [{ start: Date.parse("2026-10-12T12:00:00Z"), end: Date.parse("2026-10-12T21:00:00Z") }];
+    const why = explainDays(c, busy, "2026-10-09", 4, now);
+    expect(why.map((d) => [d.ymd, d.status])).toEqual([
+      ["2026-10-09", "past"],
+      ["2026-10-10", "closed"],
+      ["2026-10-11", "closed"],
+      ["2026-10-12", "busy"],
+    ]);
+    expect(why[3]!.busy).toEqual(["09:00–18:00"]);
+    expect(explainDays(c, [], "2026-10-13", 1, now)[0]).toMatchObject({ status: "free", free: 18 });
   });
 });
 

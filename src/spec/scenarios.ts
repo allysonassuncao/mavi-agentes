@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ActivityAssignee } from "./integrations.js";
+import { ActivityAssignee, Repeat, REPEAT_DEFAULT } from "./integrations.js";
 
 /**
  * Cenários: situações fora do roteiro em que o agente faz algo combinado
@@ -52,6 +52,8 @@ export const Scenario = z
     reply: z.enum(["agent", "fixed", "none"]).default("agent"),
     message: z.string().trim().max(1000).default(""),
     actions: ScenarioActions.default(ScenarioActions.parse({})),
+    /** Quantas vezes o cenário pode ser acionado na mesma conversa. */
+    repeat: Repeat.default(REPEAT_DEFAULT),
   })
   .strict()
   .refine((s) => s.reply !== "fixed" || !!s.message, { message: "Escreva a mensagem que o agente envia.", path: ["message"] });

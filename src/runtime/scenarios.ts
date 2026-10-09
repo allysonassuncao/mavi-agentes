@@ -7,7 +7,8 @@ import { spLabel } from "../integrations/time.js";
 import type { ToolDef } from "../llm/client.js";
 import { log } from "../log.js";
 import { rest } from "../makecrm/client.js";
-import { redis } from "../redis.js";
+import type { ActionDebug } from "../integrations/debug.js";
+import { blockedDebug, claimRepeat } from "../integrations/repeat.js";
 import type { AgentSpec } from "../spec/agent.js";
 import type { ScenarioT } from "../spec/scenarios.js";
 
@@ -48,10 +49,12 @@ export type ScenarioHit = {
   reason: string;
   /** O que foi feito (para o rastro e a nota). */
   done: string[];
+  /** Já acionado antes, dentro da configuração de repetição: nada foi refeito. */
+  repeated?: boolean;
 };
 
 /** Executa as ações do cenário (menos desligar a IA, que vem depois do envio). */
-export async function runScenario(spec: AgentSpec, args: Record<string, unknown>, ctx: IntegrationCtx): Promise<{ result: string; hit?: ScenarioHit }> {
+export async function runScenario(spec: AgentSpec, args: Record<string, unknown>, ctx: IntegrationCtx): Promise<{ result: string; hit?: ScenarioHit; debug?: ActionDebug }> {
   const s = active(spec).find((x) => x.id === String(args.cenario ?? ""));
   if (!s) return { result: "Cenário desconhecido." };
   const reason = String(args.motivo ?? "").trim().slice(0, 500);
@@ -68,9 +71,20 @@ export async function runScenario(spec: AgentSpec, args: Record<string, unknown>
 
   if (ctx.simulation) {
     const plan = await describe(s);
-    return { result: `Simulação: o cenário "${s.name}" faria: ${plan.join("; ") || "nada no CRM"}. ${guide}`, hit: { scenario: s, reason, done: plan } };
+    return {
+      result: `Simulação: o cenário "${s.name}" faria: ${plan.join("; ") || "nada no CRM"}. ${guide}`,
+      hit: { scenario: s, reason, done: plan },
+      debug: { outcome: "simulated", code: "scenario", summary: `Cenário "${s.name}" (simulação)`, details: plan },
+    };
   }
-  if (!(await redis().set(`sc:${ctx.conversationId}:${s.id}`, "1", "EX", 6 * 3600, "NX"))) return { result: `Cenário já acionado nesta conversa. ${guide}`, hit: { scenario: s, reason, done: ["já acionado antes"] } };
+  // Quantas vezes por conversa: a configuração do cenário. Já acionado: não refaz as ações, mas a resposta segue o combinado.
+  const claim = await claimRepeat(ctx.conversationId, `sc:${s.id}`, s.repeat);
+  if (!claim.ok)
+    return {
+      result: `Cenário já acionado nesta conversa: as ações não se repetem agora. ${guide}`,
+      hit: { scenario: s, reason, done: ["já acionado antes (não repetiu as ações)"], repeated: true },
+      debug: blockedDebug(claim, `Cenário "${s.name}"`, s.repeat),
+    };
 
   const step = async (label: string, fn: () => Promise<unknown>) => {
     try {
@@ -110,12 +124,25 @@ export async function runScenario(spec: AgentSpec, args: Record<string, unknown>
     done.push("follow-up parado");
   }
   if (!deals.length && (a.lost_reason_id || a.activity || a.stage)) done.push("sem oportunidade no CRM para as ações na oportunidade");
-  return { result: `Cenário "${s.name}" acionado. ${guide}`, hit: { scenario: s, reason, done } };
+  const failed = done.filter((d) => d.includes("(falhou:"));
+  return {
+    result: `Cenário "${s.name}" acionado. ${guide}`,
+    hit: { scenario: s, reason, done },
+    debug: {
+      outcome: failed.length ? "error" : "ok",
+      code: failed.length ? "error" : "scenario",
+      summary: `Cenário "${s.name}"${reason ? ` (o lead: ${reason})` : ""}.`,
+      details: done,
+      ...(failed.length ? { hint: "Uma ou mais ações do cenário falharam no MakeCRM; veja o detalhe acima." } : {}),
+    },
+  };
 }
 
 /** Depois do envio: desliga a IA na conversa (se pedido), deixa a nota privada e o registro. */
 export async function finishScenario(hit: ScenarioHit, ctx: IntegrationCtx, turnId: string | null): Promise<void> {
   const s = hit.scenario;
+  // Repetido: a resposta segue o combinado, mas sem nova nota, sem desligar de novo e sem novo registro.
+  if (hit.repeated) return;
   if (!ctx.simulation && ctx.makecrmConversationId) {
     if (s.actions.turn_off_ai) {
       await rest(`inbox_conversations?id=eq.${encodeURIComponent(ctx.makecrmConversationId)}`, {

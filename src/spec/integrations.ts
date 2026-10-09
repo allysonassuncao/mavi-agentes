@@ -12,6 +12,19 @@ const id = z.string().trim().min(1).max(64);
 const uuid = z.string().uuid();
 const when = z.string().trim().min(3).max(600);
 
+/**
+ * Quantas vezes a mesma ação pode acontecer na mesma conversa: sempre que o
+ * agente decidir, no máximo uma vez a cada X minutos, ou uma vez só (até
+ * zerar a memória do lead). Padrão: uma vez por hora.
+ */
+export const Repeat = z
+  .object({
+    mode: z.enum(["always", "window", "conversation"]).default("window"),
+    minutes: z.number().int().min(5).max(43_200).default(60),
+  })
+  .strict();
+export const REPEAT_DEFAULT = { mode: "window", minutes: 60 } as const;
+
 /** Um usuário do MakeCRM no rodízio (peso = quantos por vez; horário de trabalho do MakeCRM). */
 export const RotationUser = z
   .object({ user_id: uuid, weight: z.number().int().min(1).max(100).default(1), work_hours: z.boolean().default(false) })
@@ -53,6 +66,8 @@ export const MoveDeal = z
     rules: z.array(MoveDealRule).min(1).max(30),
     /** Dispara as automações do MakeCRM (as mesmas de quando alguém move pela tela). */
     run_automations: z.boolean().default(true),
+    /** Vale para cada regra. */
+    repeat: Repeat.default(REPEAT_DEFAULT),
   })
   .strict();
 
@@ -86,6 +101,8 @@ export const ChangeOwner = z
     type: z.literal("makecrm_change_owner"),
     enabled: z.boolean().default(true),
     rules: z.array(ChangeOwnerRule).min(1).max(30),
+    /** Vale para cada regra. */
+    repeat: Repeat.default(REPEAT_DEFAULT),
   })
   .strict();
 
@@ -98,6 +115,8 @@ export const TeamNotify = z
     phones: z.array(z.string().regex(/^\d{10,15}$/, "Telefone com DDI e DDD, só números (ex.: 5511999999999).")).min(1).max(10),
     /** Quando avisar (o agente decide pela conversa). */
     when: z.string().trim().min(3).max(1000),
+    /** Qualquer aviso do mesmo lead conta (o texto muda a cada vez). */
+    repeat: Repeat.default(REPEAT_DEFAULT),
   })
   .strict();
 
@@ -139,13 +158,14 @@ export const DealActions = z
         /** Como na tela: cancela as reuniões futuras e conclui as atividades em aberto. */
         cancel_meetings: z.boolean().default(true),
         complete_activities: z.boolean().default(true),
+        repeat: Repeat.default(REPEAT_DEFAULT),
       })
       .strict()
-      .default({ enabled: false, when: "", reasons: [], cancel_meetings: true, complete_activities: true }),
+      .default({ enabled: false, when: "", reasons: [], cancel_meetings: true, complete_activities: true, repeat: REPEAT_DEFAULT }),
     won: z
-      .object({ enabled: z.boolean().default(false), when: guide })
+      .object({ enabled: z.boolean().default(false), when: guide, repeat: Repeat.default(REPEAT_DEFAULT) })
       .strict()
-      .default({ enabled: false, when: "" }),
+      .default({ enabled: false, when: "", repeat: REPEAT_DEFAULT }),
     quote: z
       .object({
         enabled: z.boolean().default(false),
@@ -155,13 +175,15 @@ export const DealActions = z
           .array(z.object({ product_id: uuid, name: z.string().trim().max(300).default(""), max_discount_pct: z.number().min(0).max(100).default(0) }).strict())
           .max(50)
           .default([]),
+        /** Vale para cada produto. */
+        repeat: Repeat.default(REPEAT_DEFAULT),
       })
       .strict()
-      .default({ enabled: false, when: "", products: [] }),
+      .default({ enabled: false, when: "", products: [], repeat: REPEAT_DEFAULT }),
     note: z
-      .object({ enabled: z.boolean().default(false), when: guide })
+      .object({ enabled: z.boolean().default(false), when: guide, repeat: Repeat.default(REPEAT_DEFAULT) })
       .strict()
-      .default({ enabled: false, when: "" }),
+      .default({ enabled: false, when: "", repeat: REPEAT_DEFAULT }),
     activity: z
       .object({
         enabled: z.boolean().default(false),
@@ -171,9 +193,18 @@ export const DealActions = z
         assignee: ActivityAssignee.default({ mode: "deal_role", role: "owner", user_id: null, users: [] }),
         /** Prazo quando o lead não combinou um dia (horas a partir de agora). */
         default_due_hours: z.number().int().min(0).max(720).default(24),
+        /** Vale para cada tipo de atividade. */
+        repeat: Repeat.default(REPEAT_DEFAULT),
       })
       .strict()
-      .default({ enabled: false, when: "", types: [], assignee: { mode: "deal_role", role: "owner", user_id: null, users: [] }, default_due_hours: 24 }),
+      .default({
+        enabled: false,
+        when: "",
+        types: [],
+        assignee: { mode: "deal_role", role: "owner", user_id: null, users: [] },
+        default_due_hours: 24,
+        repeat: REPEAT_DEFAULT,
+      }),
   })
   .strict()
   .refine((d) => d.lost.enabled || d.won.enabled || d.quote.enabled || d.note.enabled || d.activity.enabled, "Ligue ao menos uma ação.")
@@ -189,5 +220,6 @@ export type ChangeOwnerConfig = z.infer<typeof ChangeOwner>;
 export type TeamNotifyConfig = z.infer<typeof TeamNotify>;
 export type DealActionsConfig = z.infer<typeof DealActions>;
 export type ActivityAssigneeT = z.infer<typeof ActivityAssignee>;
+export type RepeatT = z.infer<typeof Repeat>;
 export type RotationUserT = z.infer<typeof RotationUser>;
 export type RoleTargetT = z.infer<typeof RoleTarget>;

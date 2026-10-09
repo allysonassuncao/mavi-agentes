@@ -13,6 +13,8 @@ import { parseGaps, recordGaps, type GapDraft } from "../insights/gap-capture.js
 import { recordCost, type CostSource } from "../costs/ledger.js";
 import { normalizeReply, splitPlainText, typingDelayMs, type ReplyMessage } from "./output.js";
 import { buildSystemPrompt, contextBlock } from "./prompt.js";
+import type { ActionDebug } from "../integrations/debug.js";
+import { spLabel } from "../integrations/time.js";
 import { finishScenario, runScenario, SCENARIO_TOOL, scenarioTool, type ScenarioHit } from "./scenarios.js";
 import { builtinTools, formatResults, RefRegistry, REPLY_TOOL } from "./tools.js";
 
@@ -130,6 +132,24 @@ export async function integrationCtx(conv: ConversationRow, spec: AgentSpec): Pr
   };
 }
 
+const CONFIRMATION_LABEL: Record<string, string> = {
+  none: "",
+  asked: "; pedimos a confirmação de presença e o lead ainda não respondeu",
+  confirmed: "; o lead confirmou presença",
+  declined: "; o lead avisou que não vai",
+};
+
+/** A reunião marcada (ou recém-terminada) com o lead, para o agente saber sem reler o histórico. */
+export async function meetingLine(conversationId: string): Promise<string | null> {
+  const [m] = await db()<{ starts_at: Date; ends_at: Date; link: string | null; confirmation: string }[]>`
+    select starts_at, ends_at, link, confirmation from public.agent_meetings
+    where conversation_id = ${conversationId} and status = 'scheduled' and ends_at > now() - interval '6 hours'
+    order by starts_at limit 1`;
+  if (!m) return null;
+  const past = m.ends_at.getTime() < Date.now();
+  return `${spLabel(m.starts_at)}${past ? " (já passou)" : ""}${m.link ? `, link ${m.link}` : ""}${CONFIRMATION_LABEL[m.confirmation] ?? ""}.`;
+}
+
 // ---------------------------------------------------------------- a vez
 
 export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
@@ -137,7 +157,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
   const t0 = Date.now();
   const timings: Record<string, number> = {};
   let usage: Usage = emptyUsage();
-  const toolLog: { name: string; args: unknown; result: string; ms: number }[] = [];
+  const toolLog: { name: string; args: unknown; result: string; ms: number; debug?: ActionDebug }[] = [];
 
   const [conv] = await sql<ConversationRow[]>`select * from public.conversations where id = ${opts.conversationId}`;
   if (!conv) return { turnId: null, status: "skipped", messages: [], attachments: {} };
@@ -221,7 +241,14 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
       role: "user",
       content:
         `${pendingText || "(mensagem sem texto)"}\n\n` +
-        contextBlock({ contactName: conv.contact_name, phone: conv.phone, facts: conv.facts, summary: spec.memory.summary ? conv.summary : "", retrieved: retrievedForPrompt }),
+        contextBlock({
+          contactName: conv.contact_name,
+          phone: conv.phone,
+          facts: conv.facts,
+          summary: spec.memory.summary ? conv.summary : "",
+          retrieved: retrievedForPrompt,
+          meeting: await meetingLine(conv.id),
+        }),
     });
 
     // 5. LLM + ferramentas
@@ -275,6 +302,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
           args = {};
         }
         let result: string;
+        let debug: ActionDebug | undefined;
         switch (call.function.name) {
           case REPLY_TOOL: {
             reply = normalizeReply(args.mensagens, spec);
@@ -307,6 +335,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
           }
           case "transferir_para_humano": {
             handoff = String(args.motivo ?? "").slice(0, 500) || "pedido de atendimento humano";
+            debug = { outcome: conv.simulation ? "simulated" : "ok", summary: `Passou para a equipe: ${handoff}` };
             result = "Transferência registrada. Agora avise o lead pela ferramenta responder.";
             break;
           }
@@ -314,15 +343,23 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
             const r = await runScenario(spec, args, ictx);
             scenario ??= r.hit;
             result = r.result;
+            debug = r.debug;
             break;
           }
           default:
             if (INTEGRATION_TOOL_NAMES.has(call.function.name)) {
               const r = await runIntegrationTool(call.function.name, args, ictx);
               result = r.result;
+              debug = r.debug;
             } else result = "Ferramenta não disponível.";
         }
-        toolLog.push({ name: call.function.name, args: call.function.name === REPLY_TOOL ? undefined : args, result: result.slice(0, 2000), ms: Date.now() - started });
+        toolLog.push({
+          name: call.function.name,
+          args: call.function.name === REPLY_TOOL ? undefined : args,
+          result: result.slice(0, 2000),
+          ms: Date.now() - started,
+          ...(debug ? { debug } : {}),
+        });
         if (call.function.name !== REPLY_TOOL) messages.push({ role: "tool", tool_call_id: call.id, content: result });
       }
     }

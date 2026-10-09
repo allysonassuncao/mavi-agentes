@@ -3,7 +3,19 @@ import { randomUUID } from "node:crypto";
 import { config } from "./config.js";
 import { ingestItem } from "./knowledge/ingest.js";
 import { log } from "./log.js";
-import { QUEUE, scheduleFollowup, scheduleTestConversation, scheduleTurn, type FollowupJob, type KnowledgeJob, type TestJob, type TurnJob } from "./queue.js";
+import {
+  QUEUE,
+  scheduleFollowup,
+  scheduleReminder,
+  scheduleTestConversation,
+  scheduleTurn,
+  type FollowupJob,
+  type KnowledgeJob,
+  type ReminderJob,
+  type TestJob,
+  type TurnJob,
+} from "./queue.js";
+import { confirmationAlert, processReminder, stepState, type MeetingRow } from "./runtime/reminders.js";
 import { runConversation, startRun } from "./tests/runner.js";
 import { db } from "./db.js";
 import { processFollowup } from "./runtime/followup.js";
@@ -11,7 +23,7 @@ import { analyzeDue } from "./insights/analyze.js";
 import { clusterGaps } from "./insights/gaps.js";
 import { redis, redisConnection } from "./redis.js";
 import { lastMessageKey } from "./api/routes/inbound.js";
-import { runTurn } from "./runtime/turn.js";
+import { publishedSpec, runTurn } from "./runtime/turn.js";
 
 /** Trava por conversa: uma resposta por vez. */
 const LOCK_MS = 5 * 60_000;
@@ -52,6 +64,57 @@ export async function processFollowupJob(job: FollowupJob): Promise<string> {
   }
 }
 
+/** Uma etapa da régua de pré-reunião, com a mesma trava da conversa que as respostas. */
+export async function processReminderJob(job: ReminderJob): Promise<string> {
+  const token = randomUUID();
+  const locked = await redis().set(lockKey(job.conversationId), token, "PX", LOCK_MS, "NX");
+  if (!locked) {
+    if ((job.attempt ?? 0) < 60) await scheduleReminder({ ...job, attempt: (job.attempt ?? 0) + 1 }, 5000);
+    return "aguardando a resposta em andamento";
+  }
+  try {
+    return await processReminder(job.meetingId, job.stepId, job.startsAt);
+  } finally {
+    await redis().eval(RELEASE, 1, lockKey(job.conversationId), token);
+  }
+}
+
+/**
+ * A cada minuto (com trava): as etapas vencidas da régua de pré-reunião das
+ * reuniões marcadas pelo agente entram na fila, e quem não confirmou presença
+ * até o limite vira aviso à equipe.
+ */
+async function remindersTick() {
+  const ok = await redis().set("rem:tick", "1", "PX", 55_000, "NX");
+  if (!ok) return;
+  const sql = db();
+  const meetings = await sql<MeetingRow[]>`
+    select m.* from public.agent_meetings m
+    join public.conversations c on c.id = m.conversation_id and not c.simulation
+    join public.bindings b on b.id = c.binding_id and b.enabled and b.removed_at is null
+    join public.agents a on a.id = m.agent_id and a.status = 'active' and a.archived_at is null
+    where m.status = 'scheduled' and m.starts_at < now() + interval '15 days' and m.ends_at > now() - interval '15 days'
+    order by m.starts_at limit 2000`;
+  if (!meetings.length) return;
+  const done = new Set(
+    (
+      await sql<{ meeting_id: string; step_id: string; starts_at: Date }[]>`
+        select meeting_id, step_id, starts_at from public.meeting_reminder_log where meeting_id = any (${meetings.map((m) => m.id)}::uuid[])`
+    ).map((r) => `${r.meeting_id}:${r.step_id}:${r.starts_at.getTime()}`),
+  );
+  for (const m of meetings) {
+    const cfg = (await publishedSpec(m.agent_id).catch(() => null))?.spec.meeting_reminders;
+    if (!cfg?.enabled) continue;
+    for (const step of cfg.steps) {
+      if (done.has(`${m.id}:${step.id}:${m.starts_at.getTime()}`)) continue;
+      // Pular também passa pelo job: fica registrado (com o motivo) no log da régua.
+      if (stepState(step, m, cfg.window).action === "wait") continue;
+      await scheduleReminder({ conversationId: m.conversation_id, meetingId: m.id, stepId: step.id, startsAt: m.starts_at.toISOString() });
+    }
+    if (m.confirmation === "asked" && !m.confirmation_alerted) await confirmationAlert(m).catch((e) => log.warn({ err: String(e) }, "pré-reunião: alerta de confirmação falhou"));
+  }
+}
+
 /** A cada minuto, um worker (com trava) põe na fila as etapas de follow-up vencidas. */
 async function followupTick() {
   const ok = await redis().set("fu:tick", "1", "PX", 55_000, "NX");
@@ -86,9 +149,14 @@ export function startWorkers() {
   void db()`select public.cost_backfill() as n`
     .then(([r]) => r?.n && log.info({ n: r.n }, "custos: gastos antigos registrados"))
     .catch((e) => log.warn({ err: String(e) }, "custos: backfill falhou"));
-  const turns = new Worker<TurnJob | FollowupJob>(
+  const turns = new Worker<TurnJob | FollowupJob | ReminderJob>(
     QUEUE.turns,
-    async (job) => (job.name === "followup" ? processFollowupJob(job.data as FollowupJob) : processTurn(job.data as TurnJob)),
+    async (job) =>
+      job.name === "followup"
+        ? processFollowupJob(job.data as FollowupJob)
+        : job.name === "reminder"
+          ? processReminderJob(job.data as ReminderJob)
+          : processTurn(job.data as TurnJob),
     {
     connection: redisConnection(true),
     concurrency: config().WORKER_CONCURRENCY,
@@ -107,7 +175,10 @@ export function startWorkers() {
     w.on("failed", (job, err) => log.error({ queue: w.name, job: job?.id, err: err.message }, "worker: job falhou"));
     w.on("error", (err) => log.error({ queue: w.name, err: err.message }, "worker: erro"));
   }
-  const tick = setInterval(() => void followupTick().catch((e) => log.error({ err: String(e) }, "follow-up: varredura falhou")), 60_000);
+  const tick = setInterval(() => {
+    void followupTick().catch((e) => log.error({ err: String(e) }, "follow-up: varredura falhou"));
+    void remindersTick().catch((e) => log.error({ err: String(e) }, "pré-reunião: varredura falhou"));
+  }, 60_000);
   const insights = setInterval(() => void insightsTick().catch((e) => log.error({ err: String(e) }, "insights: rodada falhou")), 2 * 60_000);
   turns.on("closing", () => {
     clearInterval(tick);

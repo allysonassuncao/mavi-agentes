@@ -19,7 +19,7 @@ vi.mock("../src/config.js", () => ({
     MAKECRM_MEET_DELETE_URL: "https://hooks.test/bb914715",
   }),
 }));
-const fetchMock = vi.fn(async () => new Response("ok"));
+const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response("ok"));
 vi.stubGlobal("fetch", fetchMock);
 
 const { parseSpec } = await import("../src/spec/agent.js");

@@ -170,6 +170,62 @@ export function freeSlots(cfg: Pick<GoogleCalendarConfig, "allowed_hours" | "dur
   return out;
 }
 
+export type DayReason = { ymd: string; status: "closed" | "past" | "busy" | "free"; free: number; busy: string[] };
+
+const hm = (t: number) => {
+  const d = new Date(t - 3 * 3600_000);
+  return `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
+};
+
+/**
+ * Por que cada dia teve (ou não) horário: fora dos horários permitidos, já
+ * passou (ou não dá a antecedência mínima), agenda ocupada (com os blocos) ou
+ * quantos horários livres. É o diagnóstico do Registro técnico.
+ */
+export function explainDays(
+  cfg: Pick<GoogleCalendarConfig, "allowed_hours" | "duration_minutes" | "min_notice_minutes" | "slot_step_minutes">,
+  busy: Busy[],
+  fromYmd: string,
+  days: number,
+  now = new Date(),
+): DayReason[] {
+  const out: DayReason[] = [];
+  const earliest = now.getTime() + cfg.min_notice_minutes * 60_000;
+  for (let i = 0; i < days; i++) {
+    const ymd = addDays(fromYmd, i);
+    const win = cfg.allowed_hours[spDayKey(ymd) as keyof typeof cfg.allowed_hours];
+    if (!win) {
+      out.push({ ymd, status: "closed", free: 0, busy: [] });
+      continue;
+    }
+    const winStart = spDate(ymd, win.from).getTime();
+    const winEnd = win.to === "23:59" ? spDate(ymd, "23:59").getTime() + 60_000 : spDate(ymd, win.to).getTime();
+    const free = freeSlots(cfg, busy, ymd, 1, now).length;
+    if (free) {
+      out.push({ ymd, status: "free", free, busy: [] });
+      continue;
+    }
+    const from = Math.max(winStart, earliest);
+    if (from + cfg.duration_minutes * 60_000 > winEnd) {
+      out.push({ ymd, status: "past", free: 0, busy: [] });
+      continue;
+    }
+    // Blocos ocupados dentro da janela (juntando os que se encostam).
+    const inWin = busy
+      .filter((b) => b.end > from && b.start < winEnd)
+      .map((b) => ({ start: Math.max(b.start, from), end: Math.min(b.end, winEnd) }))
+      .sort((a, b) => a.start - b.start);
+    const merged: Busy[] = [];
+    for (const b of inWin) {
+      const last = merged[merged.length - 1];
+      if (last && b.start <= last.end) last.end = Math.max(last.end, b.end);
+      else merged.push({ ...b });
+    }
+    out.push({ ymd, status: "busy", free: 0, busy: merged.map((b) => `${hm(b.start)}–${hm(b.end)}`) });
+  }
+  return out;
+}
+
 /** Escolhe poucos e espalhados: até `perDay` por dia, no período pedido. */
 export function spreadSlots(slots: Slot[], limit: number, period: string | null, perDay = 3): Slot[] {
   const inPeriod = slots.filter((s) => {

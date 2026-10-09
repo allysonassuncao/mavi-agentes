@@ -9,6 +9,8 @@ import type { ChangeOwnerConfig, DealActionsConfig, GoogleCalendarConfig, Integr
 import {
   busyTimes,
   CalendarError,
+  explainDays,
+  type DayReason,
   cancelEvent,
   changeAttendees,
   createEvent,
@@ -21,6 +23,8 @@ import {
 } from "./calendar.js";
 import { activeDeals, addPrivateNote, addStory, userNames, type Deal } from "./deals.js";
 import { activityAssignee, addNote, catalogProduct, conversationDeals, createActivity, createQuote, mainDeal, markLost, markWon } from "./deal-actions.js";
+import { blockedDebug, blockedMessage, claimRepeat, withRepeat } from "./repeat.js";
+import { CALENDAR_FIX, type ActionDebug } from "./debug.js";
 import { availableUsers, commitRotation, pickUser, rotationOrder } from "./rotation.js";
 import { addDays, spLabel, spYmd } from "./time.js";
 
@@ -48,7 +52,7 @@ export type IntegrationCtx = {
   facts: Record<string, unknown>;
   summary: string;
 };
-export type IntegrationResult = { result: string; silent?: boolean; action?: Record<string, unknown> };
+export type IntegrationResult = { result: string; silent?: boolean; action?: Record<string, unknown>; debug?: ActionDebug };
 
 const enabled = (spec: AgentSpec) => spec.integrations.filter((i) => i.enabled);
 const get = <T extends Integration["type"]>(spec: AgentSpec, type: T) =>
@@ -97,6 +101,15 @@ export function integrationTools(spec: AgentSpec): ToolDef[] {
         ),
       );
   }
+  if (cal && spec.meeting_reminders?.enabled && spec.meeting_reminders.steps.some((st) => st.confirm))
+    tools.push(
+      fn(
+        "registrar_confirmacao",
+        "Registra a resposta do lead ao pedido de confirmação de presença na reunião marcada. Se ele não puder ir, depois ofereça remarcar (agenda_horarios_livres e agenda_remarcar).",
+        { resposta: { type: "string", enum: ["confirmou", "nao_vai"] }, observacao: { type: "string", description: "O que o lead disse, em poucas palavras." } },
+        ["resposta"],
+      ),
+    );
   const mv = get(spec, "makecrm_move_deal");
   if (mv) {
     tools.push(
@@ -210,6 +223,7 @@ export const INTEGRATION_TOOL_NAMES = new Set([
   "agenda_cancelar",
   "agenda_convidar",
   "agenda_remover_convidado",
+  "registrar_confirmacao",
   "mover_oportunidade",
   "trocar_responsavel",
   "avisar_equipe",
@@ -221,6 +235,13 @@ export const INTEGRATION_TOOL_NAMES = new Set([
 ]);
 
 export async function runIntegrationTool(name: string, args: Record<string, unknown>, ctx: IntegrationCtx): Promise<IntegrationResult> {
+  const r = await dispatch(name, args, ctx);
+  // Sem diagnóstico próprio: o resultado vira o resumo.
+  r.debug ??= { outcome: ctx.simulation ? "simulated" : "ok", summary: r.result.split("\n")[0]!.slice(0, 300) };
+  return r;
+}
+
+async function dispatch(name: string, args: Record<string, unknown>, ctx: IntegrationCtx): Promise<IntegrationResult> {
   try {
     switch (name) {
       case "agenda_horarios_livres":
@@ -235,6 +256,8 @@ export async function runIntegrationTool(name: string, args: Record<string, unkn
         return await addGuests(need(get(ctx.spec, "google_calendar")), args, ctx);
       case "agenda_remover_convidado":
         return await removeGuests(need(get(ctx.spec, "google_calendar")), args, ctx);
+      case "registrar_confirmacao":
+        return await confirmMeeting(args, ctx);
       case "mover_oportunidade":
         return await moveDeal(need(get(ctx.spec, "makecrm_move_deal")), args, ctx);
       case "trocar_responsavel":
@@ -258,7 +281,16 @@ export async function runIntegrationTool(name: string, args: Record<string, unkn
     const msg = e instanceof CalendarError ? e.message : "Não consegui concluir agora.";
     log.warn({ tool: name, agent: ctx.agentId, err: e instanceof Error ? e.message : String(e) }, "integração falhou");
     await recordFailure(name, e, ctx).catch((err) => log.warn({ err: String(err) }, "integração: falha não registrada"));
-    return { result: `Não deu certo: ${msg} Diga ao lead, com naturalidade, que vai confirmar e retornar; não invente que deu certo.` };
+    const code = e instanceof CalendarError ? e.code : "error";
+    return {
+      result: `Não deu certo: ${msg} Diga ao lead, com naturalidade, que vai confirmar e retornar; não invente que deu certo.`,
+      debug: {
+        outcome: "error",
+        code,
+        summary: (e instanceof Error ? e.message : String(e)).slice(0, 500),
+        hint: CALENDAR_FIX[code] ?? "Tente de novo; se continuar, veja a mensagem técnica acima.",
+      },
+    };
   }
 }
 
@@ -271,6 +303,7 @@ const INTEGRATION_OF: Record<string, string> = {
   agenda_cancelar: "google_calendar",
   agenda_convidar: "google_calendar",
   agenda_remover_convidado: "google_calendar",
+  registrar_confirmacao: "google_calendar",
   mover_oportunidade: "makecrm_move_deal",
   trocar_responsavel: "makecrm_change_owner",
   avisar_equipe: "team_notify",
@@ -334,23 +367,46 @@ async function hostOrder(cfg: GoogleCalendarConfig, ctx: IntegrationCtx) {
   return cfg.distribution === "fixed" ? base : rotationOrder(ctx.agentId, "calendar", available.length ? available : base);
 }
 
+const WEEKDAY_SHORT = ["dom", "seg", "ter", "qua", "qui", "sex", "sáb"];
+const dayLabel = (ymd: string) => `${WEEKDAY_SHORT[new Date(`${ymd}T12:00:00-03:00`).getUTCDay()]} ${ymd.slice(8, 10)}/${ymd.slice(5, 7)}`;
+const PERIOD_LABEL: Record<string, string> = { manha: "manhã", tarde: "tarde", noite: "noite" };
+
 async function searchSlots(cfg: GoogleCalendarConfig, args: Record<string, unknown>, ctx: IntegrationCtx): Promise<IntegrationResult> {
   const today = spYmd(new Date());
   const asked = typeof args.a_partir_de === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args.a_partir_de) ? args.a_partir_de : today;
   const from = asked < today ? today : asked;
   const lastDay = addDays(today, cfg.days_ahead);
-  if (from > lastDay) return { result: `Só consigo marcar até ${cfg.days_ahead} dias à frente. Ofereça uma data mais próxima.` };
-  const days = Math.max(1, Math.min(cfg.days_ahead, Math.round((Date.parse(lastDay) - Date.parse(from)) / 86_400_000) + 1));
+  const limitHint = `Aumente "Marca até … dias à frente" na integração Google Agenda (hoje: ${cfg.days_ahead} dias).`;
+  if (from > lastDay)
+    return {
+      result: `Só consigo marcar até ${cfg.days_ahead} dias à frente. Ofereça uma data mais próxima.`,
+      debug: {
+        outcome: "empty",
+        code: "calendar_limit",
+        summary: `O lead pediu a partir de ${dayLabel(from)}, depois do limite de ${cfg.days_ahead} dias à frente (último dia: ${dayLabel(lastDay)}).`,
+        hint: limitHint,
+      },
+    };
+  // Até o último dia do limite, inclusive (hoje + 3 dias à frente = 4 dias de busca).
+  const days = Math.max(1, Math.round((Date.parse(lastDay) - Date.parse(from)) / 86_400_000) + 1);
   const period = typeof args.periodo === "string" && args.periodo !== "qualquer" ? args.periodo : null;
+  const searched = `Buscou de ${dayLabel(from)} a ${dayLabel(addDays(from, days - 1))}${period ? ` (período: ${PERIOD_LABEL[period] ?? period})` : ""}; limite de ${cfg.days_ahead} dias à frente.`;
 
   // Uma agenda com problema não derruba as outras; se nenhuma der certo, a
   // falha sobe (e é registrada uma vez em runIntegrationTool).
   const failures: unknown[] = [];
+  const details: string[] = [searched];
+  const reasons: DayReason[][] = [];
   let read = 0;
-  for (const host of await hostOrder(cfg, ctx)) {
+  let inOtherPeriod = 0;
+  const order = await hostOrder(cfg, ctx);
+  const names = await userNames(order.map((h) => h.user_id)).catch(() => new Map<string, string>());
+  for (const host of order) {
+    const who = names.get(host.user_id) || "anfitrião";
     const token = await googleToken(ctx.companyId, host.user_id);
     if (!token) {
       failures.push(new CalendarError("A agenda do anfitrião não está conectada no MakeCRM (conecte o Google Agenda dele lá).", "not_connected"));
+      details.push(`Agenda de ${who}: não conectada no MakeCRM.`);
       continue;
     }
     const start = new Date(`${from}T00:00:00-03:00`);
@@ -361,10 +417,30 @@ async function searchSlots(cfg: GoogleCalendarConfig, args: Record<string, unkno
       read++;
     } catch (e) {
       failures.push(e);
+      details.push(`Agenda de ${who}: não foi lida (${e instanceof Error ? e.message : String(e)}).`);
       continue;
     }
-    const slots = spreadSlots(freeSlots(cfg, busy, from, days), 6, period);
-    if (!slots.length) continue;
+    const all = freeSlots(cfg, busy, from, days);
+    const slots = spreadSlots(all, 6, period);
+    const why = explainDays(cfg, busy, from, days);
+    reasons.push(why);
+    details.push(
+      `Agenda de ${who}: ${why
+        .map((d) =>
+          d.status === "free"
+            ? `${dayLabel(d.ymd)} ${d.free} livre(s)`
+            : d.status === "closed"
+              ? `${dayLabel(d.ymd)} fora dos horários permitidos`
+              : d.status === "past"
+                ? `${dayLabel(d.ymd)} sem tempo hábil (antecedência mínima de ${cfg.min_notice_minutes} min)`
+                : `${dayLabel(d.ymd)} ocupada ${d.busy.join(", ")}`,
+        )
+        .join(" · ")}.`,
+    );
+    if (!slots.length) {
+      if (all.length) inOtherPeriod += all.length;
+      continue;
+    }
     // Achou com este anfitrião: as agendas com problema ficam registradas.
     for (const f of failures) await recordFailure("agenda_horarios_livres", f, ctx).catch(() => {});
     const stored: Record<string, StoredSlot> = {};
@@ -373,13 +449,36 @@ async function searchSlots(cfg: GoogleCalendarConfig, args: Record<string, unkno
       return `H${i + 1}: ${spLabel(s.start)}`;
     });
     await redis().set(slotsKey(ctx.conversationId), JSON.stringify(stored), "EX", 86_400);
-    return { result: `Horários livres (${cfg.duration_minutes} min):\n${lines.join("\n")}\nOfereça 2 ou 3 destes ao lead.` };
+    return {
+      result: `Horários livres (${cfg.duration_minutes} min):\n${lines.join("\n")}\nOfereça 2 ou 3 destes ao lead.`,
+      debug: { outcome: "ok", code: "calendar_slots", summary: `${slots.length} horário(s) oferecido(s) da agenda de ${who}.`, details },
+    };
   }
   // Nenhuma agenda lida: é falha (registrada e avisada), não "sem horários".
   if (!read && failures.length) throw failures[0];
   for (const f of failures) await recordFailure("agenda_horarios_livres", f, ctx).catch(() => {});
+  if (!cfg.hosts.length) return { result: "Nenhum anfitrião configurado.", debug: { outcome: "error", code: "no_hosts", summary: "Nenhum anfitrião configurado.", hint: "Escolha quem recebe as reuniões na integração Google Agenda." } };
+
+  // Por que não houve horário (o que mais pesou, nesta ordem).
+  const flat = reasons.flat();
+  const reachedLimit = addDays(from, days - 1) === lastDay;
+  let code = "calendar_full";
+  let summary = "Nenhum horário livre no período buscado.";
+  let hint = "A agenda está cheia no período: libere horários na agenda do anfitrião ou inclua mais anfitriões.";
+  if (inOtherPeriod) {
+    code = "calendar_period";
+    summary = `Havia ${inOtherPeriod} horário(s) livre(s), mas não no período pedido pelo lead (${PERIOD_LABEL[period ?? ""] ?? period}).`;
+    hint = "Nada a corrigir se o lead só pode nesse período; senão, libere horários nesse período em \"Dias e horários em que o agente pode marcar\".";
+  } else if (flat.length && flat.every((d) => d.status === "closed" || d.status === "past")) {
+    code = "calendar_no_hours";
+    summary = "Nenhum dia do período está nos horários permitidos (ou já não dá tempo hoje).";
+    hint = `Libere mais dias ou horários em "Dias e horários em que o agente pode marcar"${reachedLimit ? ` ou ${limitHint.charAt(0).toLowerCase()}${limitHint.slice(1, -1)}` : ""}.`;
+  } else if (reachedLimit) {
+    hint = `${hint} ${limitHint}`;
+  }
   return {
-    result: cfg.hosts.length ? "Não há horários livres no período. Ofereça outro dia ou diga que a equipe vai retornar." : "Nenhum anfitrião configurado.",
+    result: "Não há horários livres no período. Ofereça outro dia ou diga que a equipe vai retornar.",
+    debug: { outcome: "empty", code, summary, details, hint },
   };
 }
 
@@ -525,6 +624,34 @@ async function currentMeeting(ctx: IntegrationCtx) {
   return m ?? null;
 }
 
+/** A resposta do lead ao pedido de confirmação (régua de pré-reunião). */
+async function confirmMeeting(args: Record<string, unknown>, ctx: IntegrationCtx): Promise<IntegrationResult> {
+  const answer = args.resposta === "nao_vai" ? "declined" : args.resposta === "confirmou" ? "confirmed" : null;
+  if (!answer) return { result: "Resposta desconhecida.", silent: true };
+  const obs = String(args.observacao ?? "").trim().slice(0, 300);
+  if (ctx.simulation)
+    return {
+      result: answer === "confirmed" ? "Simulação: presença confirmada. Agradeça." : "Simulação: o lead não vai. Ofereça remarcar.",
+      debug: { outcome: "simulated", summary: answer === "confirmed" ? "Presença confirmada (simulação)." : "O lead não vai (simulação)." },
+    };
+  const m = await currentMeeting(ctx);
+  if (!m) return { result: "Não há reunião marcada por mim com este lead.", silent: true, debug: { outcome: "empty", code: "no_meeting", summary: "Não havia reunião marcada pelo agente." } };
+  await db()`update public.agent_meetings set confirmation = ${answer}, confirmation_at = now(), updated_at = now() where id = ${m.id}`;
+  const label = spLabel(m.starts_at);
+  for (const d of m.deal_ids)
+    await addStory(d, ctx.maviUserId, `<strong>${answer === "confirmed" ? "Presença confirmada" : "O lead avisou que não vai"}</strong> na reunião de ${label}${obs ? `<br/>${obs}` : ""} (pela MAVI)`).catch(() => {});
+  if (answer === "declined") {
+    const notify = get(ctx.spec, "team_notify");
+    if (notify && ctx.spec.meeting_reminders?.confirmation.notify_on_decline)
+      await sendTeamNotice(notify, `O lead avisou que não vai à reunião de ${label}${obs ? `: ${obs}` : ""}. O agente vai oferecer remarcar.`, ctx).catch(() => {});
+    return {
+      result: "Registrado. Ofereça remarcar: busque horários com agenda_horarios_livres e, se ele escolher, use agenda_remarcar; se não quiser remarcar, cancele com agenda_cancelar.",
+      debug: { outcome: "ok", code: "meeting_declined", summary: `O lead não vai à reunião de ${label}.${obs ? ` (${obs})` : ""}` },
+    };
+  }
+  return { result: "Presença confirmada. Agradeça em poucas palavras.", debug: { outcome: "ok", code: "meeting_confirmed", summary: `Presença confirmada na reunião de ${label}.` } };
+}
+
 async function reschedule(cfg: GoogleCalendarConfig, args: Record<string, unknown>, ctx: IntegrationCtx): Promise<IntegrationResult> {
   const m = ctx.simulation ? null : await currentMeeting(ctx);
   if (!m && !ctx.simulation) return { result: "Não há reunião marcada por mim com este lead. Para marcar, use agenda_marcar." };
@@ -547,7 +674,9 @@ async function reschedule(cfg: GoogleCalendarConfig, args: Record<string, unknow
     body: JSON.stringify({ start: slot.start, end: slot.end }),
   }).catch(() => {});
   for (const d of m!.deal_ids) await addStory(d, ctx.maviUserId, `<strong>Reunião remarcada pela MAVI</strong><br/>Nova data: ${spLabel(new Date(slot.start))}`).catch(() => {});
-  await db()`update public.agent_meetings set starts_at = ${slot.start}, ends_at = ${slot.end}, updated_at = now() where id = ${m!.id}`;
+  // Novo horário: a confirmação de presença (régua de pré-reunião) recomeça.
+  await db()`update public.agent_meetings set starts_at = ${slot.start}, ends_at = ${slot.end}, confirmation = 'none', confirmation_at = null,
+    confirmation_alerted = false, scheduled_at = now(), updated_at = now() where id = ${m!.id}`;
   await redis().del(slotsKey(ctx.conversationId));
   return { result: `Reunião remarcada para ${spLabel(new Date(slot.start))}. Confirme ao lead.` };
 }
@@ -632,11 +761,11 @@ async function moveDeal(cfg: MoveDealConfig, args: Record<string, unknown>, ctx:
     const stage = await stageOf(rule.pipeline_id, rule.stage_id);
     return { result: stage ? `Simulação: a oportunidade iria para a etapa "${stage.name}". Siga a conversa sem comentar.` : "A etapa da regra não existe mais no CRM.", silent: true };
   }
-  // Uma vez por regra e conversa a cada hora (o lead pode repetir a mesma coisa).
-  const dedup = `mv:${ctx.conversationId}:${rule.id}`;
-  if (!(await redis().set(dedup, "1", "EX", 3600, "NX"))) return { result: "Já feito.", silent: true };
-  const r = await moveDealsTo(ctx, rule.pipeline_id, rule.stage_id, args.motivo ? String(args.motivo) : "", cfg.run_automations);
-  return { ...r, silent: true, action: { type: "mover_oportunidade", rule: rule.id } };
+  // Quantas vezes por conversa: a configuração da integração (vale para cada regra).
+  return withRepeat(ctx.conversationId, `mv:${rule.id}`, cfg.repeat, "Mover a oportunidade por esta regra", async () => {
+    const r = await moveDealsTo(ctx, rule.pipeline_id, rule.stage_id, args.motivo ? String(args.motivo) : "", cfg.run_automations);
+    return { ...r, silent: true, action: { type: "mover_oportunidade", rule: rule.id } };
+  });
 }
 
 async function stageOf(pipelineId: string, stageId: string) {
@@ -653,7 +782,7 @@ export async function moveDealsTo(ctx: IntegrationCtx, pipelineId: string, stage
   if (!stage) return { result: "A etapa não existe mais no CRM (avise a equipe para corrigir a configuração)." };
   if (!ctx.makecrmConversationId) return { result: "Sem conversa no CRM." };
   const deals = await activeDeals(ctx.makecrmConversationId);
-  if (!deals.length) return { result: "O lead não tem oportunidade ativa: nada a mover. Siga a conversa." };
+  if (!deals.length) return { ...NO_DEAL, result: "O lead não tem oportunidade ativa: nada a mover. Siga a conversa." };
   const stageNames = new Map(
     (await rest<{ id: string; name: string }[]>(`pipeline_stages?select=id,name&id=in.(${[...new Set(deals.map((d) => d.stage_id))].join(",")})`)).map((s) => [s.id, s.name]),
   );
@@ -697,9 +826,15 @@ const ROLE_LABEL = { owner: "Proprietário", sdr: "SDR", closer: "Closer" } as c
 async function changeOwner(cfg: ChangeOwnerConfig, args: Record<string, unknown>, ctx: IntegrationCtx): Promise<IntegrationResult> {
   const rule = cfg.rules.find((r) => r.id === String(args.regra ?? ""));
   if (!rule) return { result: "Regra desconhecida.", silent: true };
+  if (ctx.simulation) return changeOwnerNow(rule, args, ctx);
+  // Antes do rodízio: uma troca bloqueada não conta a vez de ninguém.
+  return withRepeat(ctx.conversationId, `ow:${rule.id}`, cfg.repeat, "Trocar o responsável por esta regra", () => changeOwnerNow(rule, args, ctx));
+}
+
+async function changeOwnerNow(rule: ChangeOwnerConfig["rules"][number], args: Record<string, unknown>, ctx: IntegrationCtx): Promise<IntegrationResult> {
   if (!ctx.simulation && !ctx.makecrmConversationId) return { result: "Sem conversa no CRM.", silent: true };
   const deals = ctx.simulation ? [] : await activeDeals(ctx.makecrmConversationId!);
-  if (!ctx.simulation && !deals.length) return { result: "O lead não tem oportunidade ativa: nada a trocar. Siga a conversa.", silent: true };
+  if (!ctx.simulation && !deals.length) return { ...NO_DEAL, result: "O lead não tem oportunidade ativa: nada a trocar. Siga a conversa." };
 
   const roles = (Object.keys(ROLE_COL) as (keyof typeof ROLE_COL)[]).filter((r) => rule[r]);
   const chosen: Partial<Record<keyof typeof ROLE_COL, string>> = {};
@@ -750,9 +885,8 @@ async function notifyTeam(cfg: TeamNotifyConfig, args: Record<string, unknown>, 
   const message = String(args.mensagem ?? "").trim().slice(0, 1500);
   if (!message) return { result: "Mensagem vazia.", silent: true };
   if (ctx.simulation) return { result: `Simulação: a equipe receberia: "${message}".`, silent: true };
-  const dedup = `nt:${ctx.conversationId}:${message.slice(0, 80)}`;
-  if (!(await redis().set(dedup, "1", "EX", 300, "NX"))) return { result: "Já avisado.", silent: true };
-  return { ...(await sendTeamNotice(cfg, message, ctx)), silent: true };
+  // Qualquer aviso do mesmo lead conta: o texto muda a cada vez que o agente escreve.
+  return withRepeat(ctx.conversationId, "nt", cfg.repeat, "O aviso à equipe sobre este lead", async () => ({ ...(await sendTeamNotice(cfg, message, ctx)), silent: true as const }));
 }
 
 /** O aviso pelo WhatsApp da caixa configurada (Uazapi). */
@@ -783,9 +917,16 @@ const pick = <T>(list: T[], prefix: string, v: unknown): T | undefined => {
   const m = String(v ?? "").trim().toUpperCase().match(new RegExp(`^${prefix}(\\d+)$`));
   return m ? list[Number(m[1]) - 1] : undefined;
 };
-const NO_DEAL = { result: "O lead não tem oportunidade aberta no CRM: nada a fazer. Siga a conversa.", silent: true };
-/** Uma vez por conversa e chave no intervalo (o lead pode repetir a mesma coisa). */
-const once = async (ctx: IntegrationCtx, key: string, seconds: number) => !!(await redis().set(`da:${ctx.conversationId}:${key}`, "1", "EX", seconds, "NX"));
+const NO_DEAL: IntegrationResult = {
+  result: "O lead não tem oportunidade aberta no CRM: nada a fazer. Siga a conversa.",
+  silent: true,
+  debug: {
+    outcome: "empty",
+    code: "no_deal",
+    summary: "O lead não tem oportunidade aberta no MakeCRM.",
+    hint: "As ações na oportunidade só valem com uma oportunidade aberta ligada à conversa (crie pela automação de entrada do MakeCRM ou manualmente).",
+  },
+};
 
 async function lostTool(cfg: DealActionsConfig, args: Record<string, unknown>, ctx: IntegrationCtx): Promise<IntegrationResult> {
   const reason = pick(cfg.lost.reasons, "R", args.motivo);
@@ -795,9 +936,10 @@ async function lostTool(cfg: DealActionsConfig, args: Record<string, unknown>, c
   if (!ctx.makecrmConversationId) return { result: "Sem conversa no CRM.", silent: true };
   const deals = (await conversationDeals(ctx.makecrmConversationId)).filter((d) => d.status === 1);
   if (!deals.length) return NO_DEAL;
-  if (!(await once(ctx, "lost", 3600))) return { result: "Já feito.", silent: true };
-  for (const d of deals) await markLost(ctx, d, reason.id, obs, { cancelMeetings: cfg.lost.cancel_meetings, completeActivities: cfg.lost.complete_activities });
-  return { result: "Feito. Siga a conversa sem comentar.", silent: true, action: { type: "dar_como_perdido", reason: reason.id, deals: deals.map((d) => d.id) } };
+  return withRepeat(ctx.conversationId, "lost", cfg.lost.repeat, "Dar a oportunidade como perdida", async () => {
+    for (const d of deals) await markLost(ctx, d, reason.id, obs, { cancelMeetings: cfg.lost.cancel_meetings, completeActivities: cfg.lost.complete_activities });
+    return { result: "Feito. Siga a conversa sem comentar.", silent: true, action: { type: "dar_como_perdido", reason: reason.id, deals: deals.map((d) => d.id) } };
+  });
 }
 
 async function wonTool(cfg: DealActionsConfig, args: Record<string, unknown>, ctx: IntegrationCtx): Promise<IntegrationResult> {
@@ -806,10 +948,14 @@ async function wonTool(cfg: DealActionsConfig, args: Record<string, unknown>, ct
   if (!ctx.makecrmConversationId) return { result: "Sem conversa no CRM.", silent: true };
   const deal = await mainDeal(ctx.makecrmConversationId);
   if (!deal) return NO_DEAL;
-  if (!(await once(ctx, "won", 3600))) return { result: "Já feito.", silent: true };
-  const r = await markWon(ctx, deal, obs);
+  const claim = await claimRepeat(ctx.conversationId, "won", cfg.won.repeat);
+  if (!claim.ok) return { result: blockedMessage(claim, "Dar a oportunidade como ganha"), silent: true, debug: blockedDebug(claim, "Dar a oportunidade como ganha", cfg.won.repeat) };
+  const r = await markWon(ctx, deal, obs).catch(async (e) => {
+    await claim.release();
+    throw e;
+  });
   if (!r.ok) {
-    await redis().del(`da:${ctx.conversationId}:won`);
+    await claim.release();
     return {
       result: cfg.quote.enabled
         ? "A oportunidade não tem orçamento. Registre o orçamento com registrar_orcamento e depois dê como ganha."
@@ -838,12 +984,13 @@ async function quoteTool(cfg: DealActionsConfig, args: Record<string, unknown>, 
   if (!ctx.makecrmConversationId) return { result: "Sem conversa no CRM.", silent: true };
   const deal = await mainDeal(ctx.makecrmConversationId);
   if (!deal) return NO_DEAL;
-  if (!(await once(ctx, `quote:${product.id}:${price}`, 900))) return { result: "Já registrado.", silent: true };
-  const label = await createQuote(ctx, deal, product, price, obs);
-  return { result: `Orçamento registrado (${label}). Siga a conversa sem comentar.`, silent: true, action: { type: "registrar_orcamento", deal: deal.id, product: product.id, price } };
+  return withRepeat(ctx.conversationId, `quote:${product.id}`, cfg.quote.repeat, "O orçamento deste produto", async () => {
+    const label = await createQuote(ctx, deal, product, price, obs);
+    return { result: `Orçamento registrado (${label}). Siga a conversa sem comentar.`, silent: true, action: { type: "registrar_orcamento", deal: deal.id, product: product.id, price } };
+  });
 }
 
-async function noteTool(_cfg: DealActionsConfig, args: Record<string, unknown>, ctx: IntegrationCtx): Promise<IntegrationResult> {
+async function noteTool(cfg: DealActionsConfig, args: Record<string, unknown>, ctx: IntegrationCtx): Promise<IntegrationResult> {
   const text = String(args.texto ?? "").trim().slice(0, 2000);
   if (!text) return { result: "Texto vazio.", silent: true };
   if (ctx.simulation) return { result: `Simulação: ficaria no histórico: "${text}".`, silent: true };
@@ -852,9 +999,10 @@ async function noteTool(_cfg: DealActionsConfig, args: Record<string, unknown>, 
   const target = deals.filter((d) => d.status === 1);
   const ids = (target.length ? target : deals.slice(0, 1)).map((d) => d.id);
   if (!ids.length) return NO_DEAL;
-  if (!(await once(ctx, `note:${text.slice(0, 80)}`, 600))) return { result: "Já registrado.", silent: true };
-  await addNote(ctx, ids, "Observação da MAVI", text);
-  return { result: "Registrado. Siga a conversa sem comentar.", silent: true };
+  return withRepeat(ctx.conversationId, "note", cfg.note.repeat, "A observação no histórico", async () => {
+    await addNote(ctx, ids, "Observação da MAVI", text);
+    return { result: "Registrado. Siga a conversa sem comentar.", silent: true };
+  });
 }
 
 async function activityTool(cfg: DealActionsConfig, args: Record<string, unknown>, ctx: IntegrationCtx): Promise<IntegrationResult> {
@@ -871,8 +1019,9 @@ async function activityTool(cfg: DealActionsConfig, args: Record<string, unknown
     return { result: `Simulação: atividade "${type.name}: ${subject}" para ${spLabel(doIn)}${name ? ` com ${name}` : " com o responsável da oportunidade"}. Siga a conversa sem comentar.`, silent: true };
   }
   if (!deal) return NO_DEAL;
-  if (!(await once(ctx, `activity:${type.id}:${subject.slice(0, 60)}`, 1800))) return { result: "Já criada.", silent: true };
-  const userId = await activityAssignee(ctx, deal, cfg.activity.assignee, "activity");
-  await createActivity(ctx, deal, { typeId: type.id, subject, description: String(args.descricao ?? "").trim().slice(0, 2000), doIn, userId });
-  return { result: "Atividade criada. Siga a conversa sem comentar.", silent: true, action: { type: "criar_atividade", deal: deal.id, user: userId } };
+  return withRepeat(ctx.conversationId, `activity:${type.id}`, cfg.activity.repeat, `A atividade do tipo ${type.name}`, async () => {
+    const userId = await activityAssignee(ctx, deal, cfg.activity.assignee, "activity");
+    await createActivity(ctx, deal, { typeId: type.id, subject, description: String(args.descricao ?? "").trim().slice(0, 2000), doIn, userId });
+    return { result: "Atividade criada. Siga a conversa sem comentar.", silent: true, action: { type: "criar_atividade", deal: deal.id, user: userId } };
+  });
 }
