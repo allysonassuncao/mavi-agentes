@@ -3,8 +3,10 @@ import { z } from "zod";
 import { config } from "../../config.js";
 import { newToken, sha256 } from "../../crypto.js";
 import { db } from "../../db.js";
+import { connectedUsers } from "../../integrations/calendar.js";
 import {
   companyByMakeId,
+  rest,
   getInbox,
   getInboxWebhook,
   inboxBlockedByLegacyAgent,
@@ -236,6 +238,38 @@ export async function agentRoutes(app: FastifyInstance) {
         kind: i.type_id === 1 ? "whatsapp_uazapi" : "whatsapp_business_api",
         bound_agent: byInbox.get(i.id) ? { id: byInbox.get(i.id)!.agent_id, name: byInbox.get(i.id)!.name } : null,
       })),
+    };
+  });
+
+  /** Funis e etapas ativos da empresa (para as regras de mover oportunidade). */
+  app.get("/v1/makecrm/companies/:companyId/pipelines", async (req) => {
+    const { companyId } = req.params as { companyId: string };
+    if (!canCompany(req, companyId)) throw new HttpError(403, "Sem acesso a esta empresa.");
+    const pipelines = await rest<{ id: string; name: string }[]>(
+      `pipelines?select=id,name&company_id=eq.${encodeURIComponent(companyId)}&status=eq.true&order=created_at.asc`,
+    );
+    const stages = pipelines.length
+      ? await rest<{ id: string; name: string; pipeline_id: string; order: number }[]>(
+          `pipeline_stages?select=id,name,pipeline_id,order&pipeline_id=in.(${pipelines.map((p) => p.id).join(",")})&status=eq.true&order=order.asc`,
+        )
+      : [];
+    return { pipelines: pipelines.map((p) => ({ ...p, stages: stages.filter((s) => s.pipeline_id === p.id) })) };
+  });
+
+  /** Usuários ativos da empresa (sem os de IA) e se têm o Google Agenda conectado no MakeCRM. */
+  app.get("/v1/makecrm/companies/:companyId/users", async (req) => {
+    const { companyId } = req.params as { companyId: string };
+    if (!canCompany(req, companyId)) throw new HttpError(403, "Sem acesso a esta empresa.");
+    const [users, google] = await Promise.all([
+      rest<{ id: string; name: string | null; email: string | null; role: number; is_ia: boolean | null }[]>(
+        `users?select=id,name,email,role,is_ia&company_id=eq.${encodeURIComponent(companyId)}&status=eq.true&order=name.asc`,
+      ),
+      connectedUsers(companyId),
+    ]);
+    return {
+      users: users
+        .filter((u) => !u.is_ia && u.role !== 4)
+        .map((u) => ({ id: u.id, name: u.name ?? u.email ?? "Usuário", email: u.email, google: google.find((g) => g.user_id === u.id)?.email ?? null })),
     };
   });
 

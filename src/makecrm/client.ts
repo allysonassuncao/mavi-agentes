@@ -15,7 +15,7 @@ function restHeaders(extra: Record<string, string> = {}) {
   return { apikey: key, authorization: `Bearer ${key}`, "content-type": "application/json", ...extra };
 }
 
-async function rest<T>(path: string, init: RequestInit & { headers?: Record<string, string> } = {}): Promise<T> {
+export async function rest<T>(path: string, init: RequestInit & { headers?: Record<string, string> } = {}): Promise<T> {
   const res = await fetch(`${base()}/rest/v1/${path}`, {
     ...init,
     headers: restHeaders(init.headers),

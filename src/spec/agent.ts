@@ -31,17 +31,10 @@ export const Persona = z
   })
   .strict();
 
-const Time = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "Horário no formato HH:MM");
-const Day = z
-  .object({ from: Time, to: Time })
-  .strict()
-  .refine((d) => d.from < d.to, "O horário de início deve ser antes do fim.")
-  .nullable();
-/** Horário da semana (null = fechado; ausente = não informado). */
-export const WeeklyHours = z
-  .object({ mon: Day.optional(), tue: Day.optional(), wed: Day.optional(), thu: Day.optional(), fri: Day.optional(), sat: Day.optional(), sun: Day.optional() })
-  .strict();
-export type WeeklyHours = z.infer<typeof WeeklyHours>;
+export { WeeklyHours } from "./weekly-hours.js";
+export type { WeeklyHours as WeeklyHoursT } from "./weekly-hours.js";
+import { WeeklyHours } from "./weekly-hours.js";
+import { Integration } from "./integrations.js";
 
 export const Instructions = z
   .object({
@@ -156,6 +149,8 @@ export const AgentSpec = z
     output: Output.default(Output.parse({})),
     model: Model.default(Model.parse({})),
     handoff: Handoff.default(Handoff.parse({})),
+    /** O que o agente pode fazer: Google Agenda, oportunidade e responsáveis no MakeCRM, aviso à equipe. */
+    integrations: z.array(Integration).max(10).default([]),
     tools: z.array(ToolRef).max(40).default([]),
     automations: z.array(z.record(z.string(), z.unknown())).max(40).default([]),
   })

@@ -1,4 +1,6 @@
-import type { AgentSpec, WeeklyHours } from "../spec/agent.js";
+import type { AgentSpec } from "../spec/agent.js";
+import type { WeeklyHours } from "../spec/weekly-hours.js";
+import { integrationsPrompt } from "../integrations/prompt.js";
 
 const DAY_NAMES: [keyof WeeklyHours, string][] = [
   ["mon", "Segunda"],
@@ -88,6 +90,9 @@ export function buildSystemPrompt(spec: AgentSpec): string {
   }
   knowledgeRules.push("Se não encontrar a informação, diga com naturalidade que vai confirmar e siga a conversa; não chute.");
   parts.push(`# Conhecimento\n${bullets(knowledgeRules)}`);
+
+  const actions = integrationsPrompt(spec);
+  if (actions) parts.push(actions);
 
   if (spec.memory.contact_fields.length) {
     parts.push(

@@ -3,7 +3,7 @@
 # de ambiente (Environment variables) com os valores do .env.example.
 services:
   api:
-    image: ${IMAGE:-allysonassuncao/mavi-agentes:v3}
+    image: ${IMAGE:-allysonassuncao/mavi-agentes:v4}
     command: ["node", "dist/main-api.js"]
     environment: &env
       NODE_ENV: production
@@ -17,6 +17,9 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      # Google Agenda: o mesmo aplicativo OAuth do MakeCRM (renova o acesso às agendas conectadas lá).
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
       # Cofre das chaves de API dos agentes (32 bytes em base64). Não troque: as chaves salvas deixam de abrir.
       SECRETS_KEY: ${SECRETS_KEY}
       DEFAULT_MODEL: ${DEFAULT_MODEL:-openai/gpt-5.2}
@@ -43,7 +46,7 @@ services:
     logging: { driver: json-file, options: { max-size: "10m", max-file: "5" } }
 
   worker:
-    image: ${IMAGE:-allysonassuncao/mavi-agentes:v3}
+    image: ${IMAGE:-allysonassuncao/mavi-agentes:v4}
     command: ["node", "dist/main-worker.js"]
     environment: *env
     depends_on: [agentes-redis]

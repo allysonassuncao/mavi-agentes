@@ -8,6 +8,7 @@ import { handOffToHuman, sendMessage, type OutgoingAttachment } from "../makecrm
 import { parseSpec, type AgentSpec } from "../spec/agent.js";
 import { understandMedia } from "./media.js";
 import { agentKeys } from "../secrets.js";
+import { INTEGRATION_TOOL_NAMES, integrationTools, runIntegrationTool, type IntegrationCtx } from "../integrations/index.js";
 import { normalizeReply, splitPlainText, typingDelayMs, type ReplyMessage } from "./output.js";
 import { buildSystemPrompt, contextBlock } from "./prompt.js";
 import { builtinTools, formatResults, RefRegistry, REPLY_TOOL } from "./tools.js";
@@ -173,7 +174,26 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
 
     // 5. LLM + ferramentas
     tm = Date.now();
-    const tools = builtinTools(spec);
+    const tools = [...builtinTools(spec), ...integrationTools(spec)];
+    // O que as integrações precisam saber da conversa (MakeCRM, contato, resumo).
+    const inboxId = conv.binding_id
+      ? ((await sql<{ inbox_id: string }[]>`select inbox_id from public.bindings where id = ${conv.binding_id}`)[0]?.inbox_id ?? null)
+      : null;
+    const ictx: IntegrationCtx = {
+      agentId: conv.agent_id,
+      agentName: spec.persona.name,
+      spec,
+      simulation: conv.simulation,
+      conversationId: conv.id,
+      makecrmConversationId: conv.simulation ? null : conv.external_id,
+      inboxId,
+      companyId: conv.company_id,
+      maviUserId: conv.mavi_user_id,
+      contactName: conv.contact_name,
+      phone: conv.phone,
+      facts: conv.facts,
+      summary: conv.summary,
+    };
     let reply: ReplyMessage[] | null = null;
     let silentReason: string | undefined;
     let handoff: string | undefined;
@@ -250,7 +270,10 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
             break;
           }
           default:
-            result = "Ferramenta não disponível.";
+            if (INTEGRATION_TOOL_NAMES.has(call.function.name)) {
+              const r = await runIntegrationTool(call.function.name, args, ictx);
+              result = r.result;
+            } else result = "Ferramenta não disponível.";
         }
         toolLog.push({ name: call.function.name, args: call.function.name === REPLY_TOOL ? undefined : args, result: result.slice(0, 2000), ms: Date.now() - started });
         if (call.function.name !== REPLY_TOOL) messages.push({ role: "tool", tool_call_id: call.id, content: result });

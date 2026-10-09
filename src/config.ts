@@ -22,6 +22,11 @@ const Env = z.object({
   // Opcionais: chaves do motor para outros provedores (os agentes podem ter as suas).
   ANTHROPIC_API_KEY: z.string().default(""),
   GOOGLE_API_KEY: z.string().default(""),
+  // Google Agenda: o mesmo aplicativo OAuth do MakeCRM (para renovar o acesso às agendas conectadas lá).
+  GOOGLE_OAUTH_CLIENT_ID: z.string().default(""),
+  GOOGLE_OAUTH_CLIENT_SECRET: z.string().default(""),
+  // As automações do MakeCRM ao mudar a etapa (o mesmo endereço que a tela do MakeCRM chama).
+  MAKECRM_AUTOMATIONS_URL: z.string().default("https://api.maso.app.br/webhook/e3a08c6a-19a6-42fc-9ca0-fdf959e0d545"),
   // Cofre das chaves dos agentes: 32 bytes em base64 (openssl rand -base64 32).
   SECRETS_KEY: z.string().default(""),
   DEFAULT_MODEL: z.string().default("openai/gpt-5.2"),
