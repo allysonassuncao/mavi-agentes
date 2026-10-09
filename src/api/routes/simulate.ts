@@ -130,14 +130,15 @@ export async function simulateRoutes(app: FastifyInstance) {
     return { conversations };
   });
 
-  app.get("/v1/conversations/:id/messages", async (req) => {
-    const { id } = req.params as { id: string };
-    assertUuid(id, "Conversa");
-    const [c] = await db()<{ company_id: string }[]>`select company_id from public.conversations where id = ${id}`;
-    if (!c || !canCompany(req, c.company_id)) throw notFound("Conversa");
+  app.get("/v1/agents/:id/conversations/:cid/messages", async (req) => {
+    const { id, cid } = req.params as { id: string; cid: string };
+    const a = await loadAgent(req, id);
+    assertUuid(cid, "Conversa");
+    const [c] = await db()<{ id: string }[]>`select id from public.conversations where id = ${cid} and agent_id = ${a.id}`;
+    if (!c) throw notFound("Conversa");
     const messages = await db()`
       select id, role, content, content_type, media, turn_id, created_at from public.messages
-      where conversation_id = ${id} order by id desc limit 300`;
+      where conversation_id = ${cid} order by id desc limit 300`;
     return { messages: messages.reverse() };
   });
 }

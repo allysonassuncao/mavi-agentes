@@ -118,7 +118,7 @@ sua pelo servidor, nunca pelo navegador.
 - `POST /v1/agents/:id/knowledge` (texto, FAQ, produto, mídia, URL) · arquivo por
   multipart · `GET` lista · `DELETE` · `POST /v1/agents/:id/knowledge/search` (teste)
 - `POST /v1/agents/:id/simulate` (rascunho ou versão; não envia nada)
-- `GET /v1/agents/:id/turns` · `GET /v1/turns/:id` · `GET /v1/agents/:id/usage`
+- `GET /v1/agents/:id/turns` · `GET /v1/turns/:id` · `GET /v1/agents/:id/usage` · `GET /v1/agents/:id/conversations` · `GET /v1/agents/:id/conversations/:cid/messages`
 
 ## Fases
 
