@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { normalizeInbound } from "../src/runtime/inbound.js";
-import { cleanText, normalizeReply } from "../src/runtime/output.js";
+import { cleanText, normalizeReply, splitInTwo } from "../src/runtime/output.js";
 import { parseSpec } from "../src/spec/agent.js";
 
 const spec = (() => {
@@ -51,5 +51,27 @@ describe("saída", () => {
       { text: "a", media: [] },
       { text: "b\n\nc", media: ["M1"] },
     ]);
+  });
+
+  it("quebra um balão longo no corte mais equilibrado", () => {
+    const t =
+      "Olá, Allyson! Eu sou a MAVI, assistente virtual da Make Vendas 😊 Transformo o WhatsApp da empresa em um canal de atendimento e vendas automatizado, com linguagem natural. Quer entender como funciona?";
+    expect(normalizeReply([{ texto: t }], spec)).toEqual([
+      { text: "Olá, Allyson! Eu sou a MAVI, assistente virtual da Make Vendas 😊", media: [] },
+      { text: "Transformo o WhatsApp da empresa em um canal de atendimento e vendas automatizado, com linguagem natural. Quer entender como funciona?", media: [] },
+    ]);
+  });
+
+  it("não quebra o que é curto, valores ou listas", () => {
+    expect(normalizeReply([{ texto: "Custa R$ 1.500. Fechamos?" }], spec)).toEqual([{ text: "Custa R$ 1.500. Fechamos?", media: [] }]);
+    expect(splitInTwo("- Plano A. Inclui tudo.\n- Plano B. Inclui menos.")).toEqual(["- Plano A. Inclui tudo.", "- Plano B. Inclui menos."]);
+    expect(splitInTwo("sem corte possível nenhum aqui")).toBeNull();
+  });
+
+  it("não passa do limite de mensagens", () => {
+    const longo = "Primeira frase bem comprida para passar do limite de tamanho do balão. ".repeat(4).trim();
+    const r = normalizeReply([{ texto: "Oi!" }, { texto: longo }], spec);
+    expect(r).toHaveLength(2);
+    expect(r[1]!.text).toBe(longo.replace(/\.$/, ""));
   });
 });

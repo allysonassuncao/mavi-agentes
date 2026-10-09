@@ -3,7 +3,7 @@
 # de ambiente (Environment variables) com os valores do .env.example.
 services:
   api:
-    image: ${IMAGE:-allysonassuncao/mavi-agentes:v4}
+    image: ${IMAGE:-allysonassuncao/mavi-agentes:v3}
     command: ["node", "dist/main-api.js"]
     environment: &env
       NODE_ENV: production
@@ -46,7 +46,7 @@ services:
     logging: { driver: json-file, options: { max-size: "10m", max-file: "5" } }
 
   worker:
-    image: ${IMAGE:-allysonassuncao/mavi-agentes:v4}
+    image: ${IMAGE:-allysonassuncao/mavi-agentes:v5}
     command: ["node", "dist/main-worker.js"]
     environment: *env
     depends_on: [agentes-redis]

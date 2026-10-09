@@ -129,6 +129,12 @@ export function buildSystemPrompt(spec: AgentSpec): string {
       bullets([
         "Sempre termine chamando a ferramenta responder.",
         `Cada item de \`mensagens\` vira uma mensagem separada no WhatsApp (no máximo ${spec.output.max_messages}).`,
+        ...(spec.output.max_messages > 1
+          ? [
+              "Escreva como uma pessoa no WhatsApp: mensagens curtas, de 1 a 2 frases, uma ideia por mensagem. Ex.: o cumprimento e a apresentação em uma; a explicação e a pergunta em outra.",
+              "Uma lista ou um passo a passo pode ficar inteiro numa mensagem só.",
+            ]
+          : []),
         "Se não houver nada a dizer (por exemplo, o lead só agradeceu depois de a conversa terminar), chame responder com `mensagens` vazio e explique em `motivo_silencio`.",
       ]),
   );
