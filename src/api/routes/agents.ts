@@ -11,7 +11,7 @@ import {
   listInboxes,
   setInboxWebhook,
 } from "../../makecrm/client.js";
-import { parseSpec } from "../../spec/agent.js";
+import { parseSpec, type AgentSpec } from "../../spec/agent.js";
 import { canCompany } from "../auth.js";
 import { assertUuid, HttpError, notFound, parseBody } from "../http.js";
 
@@ -60,12 +60,40 @@ const Draft = z.object({
   updated_by: z.string().max(200).optional(),
 });
 
+const PricingIn = z.object({ input: z.number().min(0).max(1000), output: z.number().min(0).max(1000), cached: z.number().min(0).max(1000).nullable().optional() });
 const Publish = z.object({
   note: z.string().max(500).default(""),
   published_by: z.string().max(200).optional(),
   /** Publicar de novo uma versão antiga (voltar). */
   restore_version: z.number().int().min(1).optional(),
+  /**
+   * Quem constrói pode completar a versão: o modelo padrão (e reserva) quando
+   * o rascunho deixa no padrão, e o preço de cada modelo ("<provedor>:<modelo>").
+   */
+  default_model: z.string().trim().min(1).max(160).optional(),
+  default_fallback: z.string().trim().min(1).max(160).optional(),
+  pricing: z.record(z.string(), PricingIn).optional(),
 });
+
+/** Completa a versão com o padrão e os preços vindos de quem constrói. */
+export function withModelDefaults(
+  spec: AgentSpec,
+  opts: { default_model?: string; default_fallback?: string; pricing?: Record<string, z.infer<typeof PricingIn>> },
+): AgentSpec {
+  const model = spec.model.model ?? opts.default_model ?? null;
+  const fallback = spec.model.fallback_model ?? opts.default_fallback ?? null;
+  const price = (ref: string | null) => (ref && opts.pricing?.[ref]) || null;
+  return {
+    ...spec,
+    model: {
+      ...spec.model,
+      model,
+      fallback_model: fallback,
+      pricing: price(model) ?? spec.model.pricing,
+      fallback_pricing: price(fallback) ?? spec.model.fallback_pricing,
+    },
+  };
+}
 
 const Bind = z.object({
   inbox_id: z.string().trim().min(1).max(64),
@@ -154,7 +182,7 @@ export async function agentRoutes(app: FastifyInstance) {
     } else {
       const r = parseSpec(a.draft);
       if (!r.ok) throw new HttpError(422, "O rascunho tem campos inválidos.", r.errors);
-      spec = r.spec;
+      spec = withModelDefaults(r.spec, body);
     }
     const version = await db().begin(async (tx) => {
       const [{ next } = { next: 1 }] = await tx<{ next: number }[]>`

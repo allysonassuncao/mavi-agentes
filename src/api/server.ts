@@ -8,6 +8,7 @@ import { HttpError } from "./http.js";
 import { agentRoutes } from "./routes/agents.js";
 import { inboundRoutes } from "./routes/inbound.js";
 import { knowledgeRoutes } from "./routes/knowledge.js";
+import { secretRoutes } from "./routes/secrets.js";
 import { simulateRoutes } from "./routes/simulate.js";
 
 export async function buildServer() {
@@ -39,6 +40,7 @@ export async function buildServer() {
     await admin.register(agentRoutes);
     await admin.register(knowledgeRoutes);
     await admin.register(simulateRoutes);
+    await admin.register(secretRoutes);
   });
 
   return app;

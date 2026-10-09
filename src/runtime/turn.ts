@@ -7,6 +7,7 @@ import { log } from "../log.js";
 import { handOffToHuman, sendMessage, type OutgoingAttachment } from "../makecrm/client.js";
 import { parseSpec, type AgentSpec } from "../spec/agent.js";
 import { understandMedia } from "./media.js";
+import { agentKeys } from "../secrets.js";
 import { normalizeReply, splitPlainText, typingDelayMs, type ReplyMessage } from "./output.js";
 import { buildSystemPrompt, contextBlock } from "./prompt.js";
 import { builtinTools, formatResults, RefRegistry, REPLY_TOOL } from "./tools.js";
@@ -115,6 +116,8 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
   const turnId = turnRow!.id;
   const model = spec.model.model ?? config().DEFAULT_MODEL;
   const fallback = spec.model.fallback_model ?? config().FALLBACK_MODEL;
+  // As chaves do próprio agente pagam as conversas dele; sem elas, as do motor.
+  const keys = await agentKeys(conv.agent_id);
   const reg = new RefRegistry();
   let retrievedLog: { ref: string; chunk_id: string; kind: string; title: string; score: number; via: string }[] = [];
 
@@ -189,8 +192,11 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
           temperature: spec.model.temperature,
           effort: spec.model.effort,
           maxTokens: 2000,
+          keys,
+          pricing: spec.model.pricing,
         },
         fallback,
+        spec.model.fallback_pricing,
       );
       usage = addUsage(usage, res.usage);
       usedModel = res.model;

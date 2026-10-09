@@ -106,11 +106,18 @@ export const Output = z
   })
   .strict();
 
+const Pricing = z
+  .object({ input: z.number().min(0).max(1000), output: z.number().min(0).max(1000), cached: z.number().min(0).max(1000).nullable().optional() })
+  .strict();
+
 export const Model = z
   .object({
-    /** null = padrão do motor. */
-    model: z.string().trim().min(1).max(120).nullable().default(null),
-    fallback_model: z.string().trim().min(1).max(120).nullable().default(null),
+    /** "<provedor>:<modelo>" (ex.: "openrouter:openai/gpt-5.2"); null = padrão do motor. */
+    model: z.string().trim().min(1).max(160).nullable().default(null),
+    fallback_model: z.string().trim().min(1).max(160).nullable().default(null),
+    /** Preço por milhão de tokens (do Painel da MAVI), para provedores que não devolvem o custo. */
+    pricing: Pricing.nullable().default(null),
+    fallback_pricing: Pricing.nullable().default(null),
     temperature: z.number().min(0).max(2).nullable().default(null),
     effort: z.enum(["low", "medium", "high"]).nullable().default(null),
   })

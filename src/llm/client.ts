@@ -1,4 +1,5 @@
 import { config } from "../config.js";
+import { costOf, parseModelRef, PROVIDERS, type Pricing, type ProviderKind } from "./providers.js";
 
 /**
  * Cliente mínimo para APIs compatíveis com a OpenAI (OpenRouter e OpenAI).
@@ -38,8 +39,15 @@ export function addUsage(a: Usage, b: Usage): Usage {
   };
 }
 
+/** Chaves de API próprias do agente, por provedor (a do motor fica como reserva). */
+export type AgentKeys = Partial<Record<ProviderKind, string>>;
+
 export type ChatRequest = {
+  /** "<provedor>:<modelo>" ou o formato antigo (com "/" = OpenRouter). */
   model: string;
+  keys?: AgentKeys;
+  /** Preço do modelo quando o provedor não devolve o custo. */
+  pricing?: Pricing | null;
   messages: ChatMessage[];
   tools?: ToolDef[];
   toolChoice?: "auto" | "required" | "none";
@@ -68,17 +76,29 @@ export class LlmError extends Error {
   }
 }
 
-function endpoint(model: string) {
+/** A chave do motor para um provedor (variáveis de ambiente), quando houver. */
+function serverKey(kind: ProviderKind): string {
   const c = config();
-  if (model.includes("/") && c.OPENROUTER_API_KEY) {
-    return { base: "https://openrouter.ai/api/v1", key: c.OPENROUTER_API_KEY, model, openrouter: true };
-  }
-  if (!c.OPENAI_API_KEY) throw new LlmError("Nenhuma chave de LLM configurada (OPENROUTER_API_KEY/OPENAI_API_KEY).", 0, false);
-  return { base: "https://api.openai.com/v1", key: c.OPENAI_API_KEY, model: model.replace(/^openai\//, ""), openrouter: false };
+  const env: Partial<Record<ProviderKind, string>> = {
+    openrouter: c.OPENROUTER_API_KEY,
+    openai: c.OPENAI_API_KEY,
+    anthropic: c.ANTHROPIC_API_KEY,
+    google: c.GOOGLE_API_KEY,
+  };
+  return env[kind] ?? "";
+}
+
+export const serverProviders = () => (Object.keys(PROVIDERS) as ProviderKind[]).filter((k) => !!serverKey(k));
+
+function endpoint(ref: string, keys?: AgentKeys) {
+  const { kind, model } = parseModelRef(ref);
+  const key = keys?.[kind] || serverKey(kind);
+  if (!key) throw new LlmError(`Sem chave de API da ${PROVIDERS[kind].label}: cadastre a chave no agente (Comportamento › Inteligência).`, 0, false);
+  return { base: PROVIDERS[kind].base, key, model, kind, openrouter: kind === "openrouter", own: !!keys?.[kind] };
 }
 
 export async function chat(req: ChatRequest): Promise<ChatResponse> {
-  const ep = endpoint(req.model);
+  const ep = endpoint(req.model, req.keys);
   const body: Record<string, unknown> = {
     model: ep.model,
     messages: req.messages,
@@ -93,7 +113,7 @@ export async function chat(req: ChatRequest): Promise<ChatResponse> {
   if (ep.openrouter) {
     body.usage = { include: true };
     if (req.effort) body.reasoning = { effort: req.effort };
-  } else if (req.effort && /^(gpt-5|o\d)/.test(ep.model)) {
+  } else if (req.effort && PROVIDERS[ep.kind].effort === "openai" && (ep.kind !== "openai" || /^(gpt-5|o\d)/.test(ep.model))) {
     body.reasoning_effort = req.effort;
   }
 
@@ -127,13 +147,17 @@ export async function chat(req: ChatRequest): Promise<ChatResponse> {
   if (j.error) throw new LlmError(`LLM: ${j.error.message ?? "erro"}`, j.error.code ?? 502, true);
   const choice = j.choices?.[0];
   if (!choice?.message) throw new LlmError("LLM: resposta sem mensagem", 502, true);
+  const tokensIn = j.usage?.prompt_tokens ?? 0;
+  const tokensOut = j.usage?.completion_tokens ?? 0;
+  const tokensCached = j.usage?.prompt_tokens_details?.cached_tokens ?? 0;
   return {
     message: { content: choice.message.content ?? null, tool_calls: choice.message.tool_calls },
     usage: {
-      tokensIn: j.usage?.prompt_tokens ?? 0,
-      tokensOut: j.usage?.completion_tokens ?? 0,
-      tokensCached: j.usage?.prompt_tokens_details?.cached_tokens ?? 0,
-      costUsd: j.usage?.cost ?? 0,
+      tokensIn,
+      tokensOut,
+      tokensCached,
+      // O OpenRouter devolve o custo; nos outros, pelo preço do Painel.
+      costUsd: j.usage?.cost ?? costOf(req.pricing, tokensIn, tokensOut, tokensCached),
     },
     model: j.model ?? req.model,
     finishReason: choice.finish_reason ?? null,
@@ -141,17 +165,30 @@ export async function chat(req: ChatRequest): Promise<ChatResponse> {
 }
 
 /** Uma nova tentativa no mesmo modelo para erros passageiros; depois o modelo reserva. */
-export async function chatWithFallback(req: ChatRequest, fallbackModel: string | null): Promise<ChatResponse> {
+/**
+ * Erro passageiro (429/5xx): mais uma tentativa no mesmo modelo. Depois, ou
+ * quando o modelo principal não serve (sem chave, modelo inexistente), o
+ * modelo reserva.
+ */
+export async function chatWithFallback(
+  req: ChatRequest,
+  fallbackModel: string | null,
+  fallbackPricing: Pricing | null = null,
+): Promise<ChatResponse> {
+  const fallback = async (err: unknown) => {
+    if (!fallbackModel || fallbackModel === req.model) throw err;
+    return chat({ ...req, model: fallbackModel, pricing: fallbackPricing });
+  };
   try {
     return await chat(req);
   } catch (e) {
-    if (!(e instanceof LlmError) || !e.retryable) throw e;
+    if (!(e instanceof LlmError)) throw e;
+    if (!e.retryable) return fallback(e);
     await new Promise((r) => setTimeout(r, 800));
     try {
       return await chat(req);
     } catch (e2) {
-      if (!fallbackModel || fallbackModel === req.model) throw e2;
-      return await chat({ ...req, model: fallbackModel });
+      return fallback(e2);
     }
   }
 }

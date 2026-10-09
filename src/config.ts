@@ -19,6 +19,11 @@ const Env = z.object({
   // LLMs. OpenRouter para conversar; OpenAI para vetores e transcrição.
   OPENROUTER_API_KEY: z.string().default(""),
   OPENAI_API_KEY: z.string().default(""),
+  // Opcionais: chaves do motor para outros provedores (os agentes podem ter as suas).
+  ANTHROPIC_API_KEY: z.string().default(""),
+  GOOGLE_API_KEY: z.string().default(""),
+  // Cofre das chaves dos agentes: 32 bytes em base64 (openssl rand -base64 32).
+  SECRETS_KEY: z.string().default(""),
   DEFAULT_MODEL: z.string().default("openai/gpt-5.2"),
   FALLBACK_MODEL: z.string().default("openai/gpt-4.1"),
   // Tarefas de apoio: resumo, contexto dos trechos, descrição de imagem.
