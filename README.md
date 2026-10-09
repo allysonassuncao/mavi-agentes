@@ -29,11 +29,16 @@ npm run api-client -- "MAVI Tasks"
 
 Mostra a chave uma vez; o banco guarda só o hash. Use `Authorization: Bearer <chave>`.
 
-## Produção
+## Produção (VPS com Portainer)
 
-```bash
-docker compose up -d --build
-```
+1. `./scripts/release.sh v1` — gera a imagem linux/amd64 e envia ao Docker Hub
+   (`allysonassuncao/mavi-agentes`, repositório **privado**).
+2. Portainer › Stacks: use [deploy/portainer-stack.yml](deploy/portainer-stack.yml)
+   e preencha as variáveis de ambiente.
+3. DNS: `agentes.maso.app.br` apontando para a VPS (o Traefik emite o certificado).
+4. `npm run migrate` (do seu computador) quando houver migração nova.
+
+Sem Portainer: `docker compose up -d --build` com o `.env` ao lado.
 
 `api` (HTTP, atrás do Traefik em `agentes.maso.app.br`), `worker` (2 réplicas) e
 `redis`. Segredos no `.env` do servidor, nunca no git.

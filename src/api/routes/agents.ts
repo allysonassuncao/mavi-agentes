@@ -4,6 +4,7 @@ import { config } from "../../config.js";
 import { newToken, sha256 } from "../../crypto.js";
 import { db } from "../../db.js";
 import {
+  companyByMakeId,
   getInbox,
   getInboxWebhook,
   inboxBlockedByLegacyAgent,
@@ -185,6 +186,14 @@ export async function agentRoutes(app: FastifyInstance) {
   });
 
   // ---------------------------------------------------------------- caixas do MakeCRM
+  app.get("/v1/makecrm/companies", async (req) => {
+    const makeId = Number((req.query as { make_id?: string }).make_id);
+    if (!Number.isInteger(makeId) || makeId <= 0) throw new HttpError(400, "Informe make_id (código do cliente).");
+    const company = await companyByMakeId(makeId);
+    if (!company || !canCompany(req, company.id)) throw notFound("Empresa no MakeCRM");
+    return { company };
+  });
+
   app.get("/v1/makecrm/companies/:companyId/inboxes", async (req) => {
     const { companyId } = req.params as { companyId: string };
     if (!canCompany(req, companyId)) throw new HttpError(403, "Sem acesso a esta empresa.");

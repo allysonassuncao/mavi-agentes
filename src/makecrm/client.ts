@@ -107,6 +107,14 @@ export async function handOffToHuman(input: { conversationId: string; inboxId: s
   });
 }
 
+/** Empresa do MakeCRM pelo código do cliente (companys.make_id = código do cliente na Make Vendas). */
+export async function companyByMakeId(makeId: number): Promise<{ id: string; make_id: number; status: boolean } | null> {
+  const rows = await rest<{ id: string; make_id: number; status: boolean }[]>(
+    `companys?select=id,make_id,status&make_id=eq.${makeId}&limit=1`,
+  );
+  return rows[0] ?? null;
+}
+
 export type MakecrmInbox = { id: string; name: string; type_id: number; status: boolean };
 
 /** Caixas de WhatsApp (tipos 1 Uazapi e 2 Business API) de uma empresa. */

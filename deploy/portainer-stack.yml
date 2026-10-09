@@ -1,0 +1,67 @@
+# Stack do Portainer (VPS). Imagem publicada com scripts/release.sh.
+# Em Portainer › Stacks › Add stack: cole este arquivo e preencha as variáveis
+# de ambiente (Environment variables) com os valores do .env.example.
+services:
+  api:
+    image: ${IMAGE:-allysonassuncao/mavi-agentes:v1}
+    command: ["node", "dist/main-api.js"]
+    environment: &env
+      NODE_ENV: production
+      PORT: "8080"
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://agentes.maso.app.br}
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: ${DATABASE_URL}
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SECRET_KEY: ${SUPABASE_SECRET_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      DEFAULT_MODEL: ${DEFAULT_MODEL:-openai/gpt-5.2}
+      FALLBACK_MODEL: ${FALLBACK_MODEL:-openai/gpt-4.1}
+      UTILITY_MODEL: ${UTILITY_MODEL:-openai/gpt-5-mini}
+      MAKECRM_SUPABASE_URL: ${MAKECRM_SUPABASE_URL:-https://htdjkprnspssogcetzhx.supabase.co}
+      MAKECRM_PUBLISHABLE_KEY: ${MAKECRM_PUBLISHABLE_KEY}
+      MAKECRM_SECRET_KEY: ${MAKECRM_SECRET_KEY}
+      MAKECRM_DRY_RUN: ${MAKECRM_DRY_RUN:-false}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-20}
+    depends_on: [redis]
+    restart: always
+    networks: [interna, proxy]
+    deploy:
+      resources: { limits: { cpus: "1.0", memory: 768M } }
+      labels: &traefik
+        - traefik.enable=true
+        - traefik.docker.network=${PROXY_NETWORK:-allyson-desenv}
+        - traefik.http.routers.mavi-agentes.rule=Host(`agentes.maso.app.br`)
+        - traefik.http.routers.mavi-agentes.entrypoints=websecure
+        - traefik.http.routers.mavi-agentes.tls.certresolver=letsencryptresolver
+        - traefik.http.services.mavi-agentes.loadbalancer.server.port=8080
+    labels: *traefik
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "5" } }
+
+  worker:
+    image: ${IMAGE:-allysonassuncao/mavi-agentes:v1}
+    command: ["node", "dist/main-worker.js"]
+    environment: *env
+    depends_on: [redis]
+    restart: always
+    networks: [interna]
+    deploy:
+      replicas: 2
+      resources: { limits: { cpus: "1.0", memory: 768M } }
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "5" } }
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes: [redis-data:/data]
+    restart: always
+    networks: [interna]
+
+volumes:
+  redis-data:
+
+networks:
+  interna:
+  proxy:
+    external: true
+    name: ${PROXY_NETWORK:-allyson-desenv}

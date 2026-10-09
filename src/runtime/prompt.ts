@@ -83,6 +83,7 @@ export function buildSystemPrompt(spec: AgentSpec): string {
         ? `Ao transferir, diga ao lead: "${spec.handoff.message.trim()}" (pode adaptar levemente).`
         : "Ao transferir, avise o lead de forma curta que uma pessoa da equipe vai continuar o atendimento.",
     );
+    h.push("Depois de transferir, você sai da conversa: não faça perguntas nem prometa nada que dependa de você.");
     parts.push(`# Passar para uma pessoa\n${bullets(h)}`);
   }
 
