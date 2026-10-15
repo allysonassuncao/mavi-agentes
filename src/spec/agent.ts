@@ -129,6 +129,27 @@ export const Handoff = z
   })
   .strict();
 
+export const ActivationTerm = z
+  .object({
+    term: z.string().trim().min(1).max(100),
+    /** "contains": a mensagem contém o termo; "exact": a mensagem é só o termo. Sem diferenciar maiúsculas e acentos. */
+    match: z.enum(["contains", "exact"]).default("contains"),
+  })
+  .strict();
+
+/**
+ * Ativação por gatilho: o agente só começa a responder uma conversa quando o
+ * lead manda um dos termos. Daí em diante segue a conversa toda (só rearma se
+ * a memória da conversa for zerada); as mensagens de antes viram contexto.
+ */
+export const Activation = z
+  .object({
+    enabled: z.boolean().default(false),
+    terms: z.array(ActivationTerm).max(30).default([]),
+  })
+  .strict()
+  .refine((a) => !a.enabled || a.terms.length > 0, { message: "Cadastre ao menos um termo para ativar por gatilho.", path: ["terms"] });
+
 /** Ferramentas configuráveis (Fase 2+). Por enquanto só guardadas. */
 export const ToolRef = z
   .object({
@@ -152,6 +173,8 @@ export const AgentSpec = z
     output: Output.default(Output.parse({})),
     model: Model.default(Model.parse({})),
     handoff: Handoff.default(Handoff.parse({})),
+    /** Só começa a responder a conversa depois de um termo do lead (gatilho). */
+    activation: Activation.default(Activation.parse({})),
     /** O que o agente pode fazer: Google Agenda, oportunidade e responsáveis no MakeCRM, aviso à equipe. */
     integrations: z.array(Integration).max(10).default([]),
     /** Situações fora do roteiro com ações combinadas ("quando o lead pedir X, faça Y"). */

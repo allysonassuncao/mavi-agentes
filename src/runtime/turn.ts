@@ -234,7 +234,8 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
     // 4. Mensagens para o LLM
     const messages: ChatMessage[] = [{ role: "system", content: buildSystemPrompt(spec) }];
     for (const h of history) {
-      if (h.role === "user") messages.push({ role: "user", content: h.content });
+      // Mídia de antes do gatilho não é lida (não gasta com quem não ativou o agente).
+      if (h.role === "user") messages.push({ role: "user", content: h.content || `(${h.content_type} sem texto)` });
       else messages.push({ role: "assistant", content: h.content });
     }
     messages.push({

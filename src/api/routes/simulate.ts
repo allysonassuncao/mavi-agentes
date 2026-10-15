@@ -4,7 +4,8 @@ import { randomUUID } from "node:crypto";
 import { db } from "../../db.js";
 import { redis } from "../../redis.js";
 import { MEDIA_TYPES } from "../../runtime/inbound.js";
-import { runTurn } from "../../runtime/turn.js";
+import { activateConversation, matchActivation, WAITING_TRIGGER } from "../../runtime/activation.js";
+import { runTurn, type TurnResult } from "../../runtime/turn.js";
 import { parseSpec, type AgentSpec } from "../../spec/agent.js";
 import { assertUuid, HttpError, notFound, parseBody } from "../http.js";
 import { canCompany } from "../auth.js";
@@ -50,21 +51,33 @@ export async function simulateRoutes(app: FastifyInstance) {
     }
 
     const sql = db();
-    const [conv] = await sql<{ id: string }[]>`
+    const [conv] = await sql<{ id: string; activated_at: Date | null }[]>`
       insert into public.conversations (agent_id, company_id, external_id, simulation, contact_name, phone)
       values (${a.id}, ${a.company_id}, ${body.session}, true, ${body.contact_name ?? "Lead de teste"}, '5500000000000')
       on conflict (agent_id, simulation, external_id) do update set contact_name = coalesce(${body.contact_name ?? null}, public.conversations.contact_name)
-      returning id`;
+      returning id, activated_at`;
     if (body.reset) {
       await sql`delete from public.messages where conversation_id = ${conv!.id}`;
-      await sql`update public.conversations set summary = '', summary_upto = null, facts = '{}' where id = ${conv!.id}`;
+      await sql`update public.conversations set summary = '', summary_upto = null, facts = '{}', activated_at = null where id = ${conv!.id}`;
+      conv!.activated_at = null;
     }
     if (body.facts) await sql`update public.conversations set facts = facts || ${sql.json(body.facts)} where id = ${conv!.id}`;
     const contentType = MEDIA_TYPES.has(body.content_type) && body.media_url ? body.content_type : "text";
-    await sql`
+    const [m] = await sql<{ id: string }[]>`
       insert into public.messages (conversation_id, role, content, content_type, media)
       values (${conv!.id}, 'user', ${body.message}, ${contentType},
-              ${body.media_url && contentType !== "text" ? sql.json({ url: body.media_url }) : null})`;
+              ${body.media_url && contentType !== "text" ? sql.json({ url: body.media_url }) : null})
+      returning id`;
+
+    // O mesmo gatilho das conversas reais (inbound.ts): sem o termo, fica guardada e ninguém responde.
+    if (spec.activation.enabled && !conv!.activated_at) {
+      const term = matchActivation(spec.activation.terms, body.message);
+      if (!term) {
+        const result: TurnResult = { turnId: null, status: "skipped", messages: [], attachments: {}, silentReason: WAITING_TRIGGER };
+        return { conversation_id: conv!.id, result, turn: null };
+      }
+      await activateConversation(sql, { id: conv!.id, agentId: a.id, simulation: true, version }, m!.id, term);
+    }
 
     const result = await runTurn({ conversationId: conv!.id, spec, agentVersion: version });
     const [turn] = result.turnId ? await sql`select * from public.turns where id = ${result.turnId}` : [];
@@ -137,7 +150,7 @@ export async function simulateRoutes(app: FastifyInstance) {
     const like = term ? `%${term.replace(/[%_\\]/g, (c) => `\\${c}`)}%` : null;
     const conversations = await db()`
       select id, external_id, phone, contact_name, facts, summary, last_inbound_at, last_reply_at, created_at,
-             memory_reset_at, memory_reset_by,
+             memory_reset_at, memory_reset_by, activated_at,
              (select count(*) from public.messages m where m.conversation_id = c.id and m.role in ('user', 'assistant'))::int as messages
       from public.conversations c where c.agent_id = ${a.id} and not c.simulation
         and (${like}::text is null or c.contact_name ilike ${like} or (${digits} <> '' and regexp_replace(coalesce(c.phone, ''), '\\D', '', 'g') like ${`%${digits}%`}))
@@ -231,6 +244,8 @@ export async function simulateRoutes(app: FastifyInstance) {
         await tx`
           update public.conversations set summary = '', summary_upto = null, facts = '{}',
             followup_step = 0, followup_state = 'idle', followup_next_at = null,
+            -- Com gatilho, o lead precisa mandar o termo de novo (sem gatilho, a próxima mensagem já ativa).
+            activated_at = null,
             memory_reset_at = now(), memory_reset_by = ${by}
           where id = ${cid}`;
         // Fica uma nota (o agente não lê notas) para quem abrir a conversa saber.
