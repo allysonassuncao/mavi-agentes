@@ -16,6 +16,7 @@ import {
   setInboxWebhook,
 } from "../../makecrm/client.js";
 import { parseSpec, type AgentSpec } from "../../spec/agent.js";
+import { cleanFilters, conversationIds, historyFilters, historyPage } from "../../makecrm/history.js";
 import { canCompany } from "../auth.js";
 import { assertUuid, HttpError, notFound, parseBody } from "../http.js";
 
@@ -316,6 +317,33 @@ export async function agentRoutes(app: FastifyInstance) {
         .filter((u) => !u.is_ia && u.role !== 4)
         .map((u) => ({ id: u.id, name: u.name ?? u.email ?? "Usuário", email: u.email, google: google.find((g) => g.user_id === u.id)?.email ?? null })),
     };
+  });
+
+  // ---------------------------------------------------------------- histórico (Aprender com conversas)
+  /** O que dá para escolher na busca: caixas, pessoas, etiquetas e funis com etapas. */
+  app.get("/v1/makecrm/companies/:companyId/history/filters", async (req) => {
+    const { companyId } = req.params as { companyId: string };
+    if (!canCompany(req, companyId)) throw new HttpError(403, "Sem acesso a esta empresa.");
+    return historyFilters(companyId);
+  });
+
+  /**
+   * As conversas do atendimento com os filtros: count_only devolve só quantas;
+   * senão, uma página (cursor = a posição na lista, que fica guardada 1 h).
+   */
+  app.post("/v1/makecrm/companies/:companyId/history/search", async (req) => {
+    const { companyId } = req.params as { companyId: string };
+    if (!canCompany(req, companyId)) throw new HttpError(403, "Sem acesso a esta empresa.");
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const f = cleanFilters(body);
+    if (!f) throw new HttpError(400, "Período inválido.");
+    const ids = await conversationIds(companyId, f);
+    if (body.count_only === true) return { total: ids.length };
+    const offset = Math.max(0, Number.parseInt(String(body.cursor ?? "0"), 10) || 0);
+    const limit = Math.min(Math.max(Number(body.limit) || 30, 1), 50);
+    const conversations = await historyPage(companyId, f, ids.slice(offset, offset + limit));
+    const next = offset + limit;
+    return { total: ids.length, conversations, next_cursor: next < ids.length ? String(next) : null };
   });
 
   app.post("/v1/agents/:id/bindings", async (req, reply) => {
