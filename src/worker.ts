@@ -5,10 +5,12 @@ import { ingestItem } from "./knowledge/ingest.js";
 import { log } from "./log.js";
 import {
   QUEUE,
+  scheduleCallback,
   scheduleFollowup,
   scheduleReminder,
   scheduleTestConversation,
   scheduleTurn,
+  type CallbackJob,
   type FollowupJob,
   type KnowledgeJob,
   type ReminderJob,
@@ -19,6 +21,7 @@ import { confirmationAlert, processReminder, stepState, type MeetingRow } from "
 import { runConversation, startRun } from "./tests/runner.js";
 import { db } from "./db.js";
 import { processFollowup } from "./runtime/followup.js";
+import { callbackRepliesTick, processCallback } from "./runtime/callbacks.js";
 import { analyzeDue } from "./insights/analyze.js";
 import { clusterGaps } from "./insights/gaps.js";
 import { redis, redisConnection } from "./redis.js";
@@ -77,6 +80,46 @@ export async function processReminderJob(job: ReminderJob): Promise<string> {
   } finally {
     await redis().eval(RELEASE, 1, lockKey(job.conversationId), token);
   }
+}
+
+/** Um retorno combinado, com a mesma trava da conversa que as respostas. */
+export async function processCallbackJob(job: CallbackJob): Promise<string> {
+  const token = randomUUID();
+  // Conversa ocupada: a varredura do próximo minuto põe de novo na fila (o retorno continua marcado).
+  const locked = await redis().set(lockKey(job.conversationId), token, "PX", LOCK_MS, "NX");
+  if (!locked) return "aguardando a resposta em andamento";
+  try {
+    return await processCallback(job.callbackId);
+  } finally {
+    await redis().eval(RELEASE, 1, lockKey(job.conversationId), token);
+  }
+}
+
+/**
+ * A cada minuto (com trava): os retornos combinados vencidos entram na fila;
+ * os que travaram no envio (o worker caiu no meio) viram falha; e os que já
+ * saíram são conferidos (o lead respondeu? passou do prazo sem resposta?).
+ */
+async function callbacksTick() {
+  const ok = await redis().set("cb:tick", "1", "PX", 55_000, "NX");
+  if (!ok) return;
+  const sql = db();
+  await sql`
+    update public.agent_callbacks set status = 'failed', outcome = 'o envio foi interrompido (o worker reiniciou no meio)', updated_at = now()
+    where status = 'sending' and updated_at < now() - interval '15 minutes'`;
+  const due = await sql<{ id: string; conversation_id: string; due_at: Date }[]>`
+    select k.id, k.conversation_id, k.due_at from public.agent_callbacks k
+    join public.conversations c on c.id = k.conversation_id
+    join public.bindings b on b.id = c.binding_id and b.enabled and b.removed_at is null
+    join public.agents a on a.id = k.agent_id and a.status = 'active' and a.archived_at is null
+    where k.status = 'scheduled' and k.due_at <= now() and not k.simulation
+    order by k.due_at limit 500`;
+  // A chave muda a cada minuto: o que não saiu (conversa ocupada, erro antes de começar) volta na próxima varredura;
+  // a troca de status (scheduled → sending) impede mandar duas vezes.
+  const minute = Math.floor(Date.now() / 60_000);
+  for (const k of due) await scheduleCallback({ conversationId: k.conversation_id, callbackId: k.id }, `${k.due_at.getTime()}-${minute}`);
+  const n = await callbackRepliesTick();
+  if (n) log.info({ n }, "retornos: ações de sem resposta");
 }
 
 /**
@@ -149,14 +192,16 @@ export function startWorkers() {
   void db()`select public.cost_backfill() as n`
     .then(([r]) => r?.n && log.info({ n: r.n }, "custos: gastos antigos registrados"))
     .catch((e) => log.warn({ err: String(e) }, "custos: backfill falhou"));
-  const turns = new Worker<TurnJob | FollowupJob | ReminderJob>(
+  const turns = new Worker<TurnJob | FollowupJob | ReminderJob | CallbackJob>(
     QUEUE.turns,
     async (job) =>
       job.name === "followup"
         ? processFollowupJob(job.data as FollowupJob)
         : job.name === "reminder"
           ? processReminderJob(job.data as ReminderJob)
-          : processTurn(job.data as TurnJob),
+          : job.name === "callback"
+            ? processCallbackJob(job.data as CallbackJob)
+            : processTurn(job.data as TurnJob),
     {
     connection: redisConnection(true),
     concurrency: config().WORKER_CONCURRENCY,
@@ -178,6 +223,7 @@ export function startWorkers() {
   const tick = setInterval(() => {
     void followupTick().catch((e) => log.error({ err: String(e) }, "follow-up: varredura falhou"));
     void remindersTick().catch((e) => log.error({ err: String(e) }, "pré-reunião: varredura falhou"));
+    void callbacksTick().catch((e) => log.error({ err: String(e) }, "retornos: varredura falhou"));
   }, 60_000);
   const insights = setInterval(() => void insightsTick().catch((e) => log.error({ err: String(e) }, "insights: rodada falhou")), 2 * 60_000);
   turns.on("closing", () => {

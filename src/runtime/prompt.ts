@@ -1,6 +1,6 @@
 import type { AgentSpec } from "../spec/agent.js";
 import type { WeeklyHours } from "../spec/weekly-hours.js";
-import { integrationsPrompt, scenarioPrompt } from "../integrations/prompt.js";
+import { callbacksPrompt, integrationsPrompt, scenarioPrompt } from "../integrations/prompt.js";
 
 const DAY_NAMES: [keyof WeeklyHours, string][] = [
   ["mon", "Segunda"],
@@ -95,6 +95,8 @@ export function buildSystemPrompt(spec: AgentSpec): string {
   if (actions) parts.push(actions);
   const scenarios = scenarioPrompt(spec);
   if (scenarios) parts.push(scenarios);
+  const callbacks = callbacksPrompt(spec);
+  if (callbacks) parts.push(callbacks);
 
   if (spec.memory.contact_fields.length) {
     parts.push(
@@ -179,6 +181,8 @@ export function contextBlock(input: {
   retrieved: RetrievedForPrompt[];
   /** A reunião marcada pelo agente com este lead (data, link, confirmação). */
   meeting?: string | null;
+  /** O retorno combinado com este lead (data, pedido, o que retomar). */
+  callback?: string | null;
 }): string {
   const lines: string[] = [`Agora: ${nowInBrazil(input.now)}`];
   const who = [input.contactName && `nome no WhatsApp: ${input.contactName}`, input.phone && `telefone: ${input.phone}`].filter(Boolean);
@@ -186,6 +190,7 @@ export function contextBlock(input: {
   const facts = Object.entries(input.facts).filter(([, v]) => v !== null && v !== "");
   if (facts.length) lines.push(`Dados já registrados do contato: ${facts.map(([k, v]) => `${k}: ${String(v)}`).join("; ")}`);
   if (input.meeting) lines.push(`Reunião marcada com este lead: ${input.meeting}`);
+  if (input.callback) lines.push(`Retorno combinado com este lead: ${input.callback}`);
   if (input.summary.trim()) lines.push(`Resumo das mensagens anteriores:\n${input.summary.trim()}`);
   if (input.retrieved.length) {
     lines.push(

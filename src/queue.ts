@@ -7,16 +7,18 @@ export type TurnJob = { conversationId: string; messageId: string; attempt?: num
 export type FollowupJob = { conversationId: string; step: number; attempt?: number };
 /** Uma etapa da régua de pré-reunião (reunião, etapa e o horário da reunião naquele momento). */
 export type ReminderJob = { conversationId: string; meetingId: string; stepId: string; startsAt: string; attempt?: number };
+/** Um retorno combinado na hora (a chave leva o horário e o minuto da varredura). */
+export type CallbackJob = { conversationId: string; callbackId: string };
 export type KnowledgeJob = { itemId: string };
 /** Testes com leads simulados: começar a bateria ou uma conversa dela. */
 export type TestJob = { runId: string; idx?: number };
 
-let turns: Queue<TurnJob | FollowupJob | ReminderJob> | null = null;
+let turns: Queue<TurnJob | FollowupJob | ReminderJob | CallbackJob> | null = null;
 let knowledge: Queue<KnowledgeJob> | null = null;
 let tests: Queue<TestJob> | null = null;
 
 export function turnsQueue() {
-  turns ??= new Queue<TurnJob | FollowupJob | ReminderJob>(QUEUE.turns, { connection: redisConnection() });
+  turns ??= new Queue<TurnJob | FollowupJob | ReminderJob | CallbackJob>(QUEUE.turns, { connection: redisConnection() });
   return turns;
 }
 export function testsQueue() {
@@ -61,6 +63,16 @@ export async function scheduleReminder(job: ReminderJob, delayMs = 0) {
   await turnsQueue().add("reminder", job, {
     delay: delayMs,
     jobId: `r-${job.meetingId}-${job.stepId}-${Date.parse(job.startsAt)}-${job.attempt ?? 0}`,
+    removeOnComplete: { count: 2000 },
+    removeOnFail: { count: 5000 },
+  });
+}
+
+/** Um retorno combinado (na fila das respostas: uma coisa por vez por conversa). */
+export async function scheduleCallback(job: CallbackJob, key: string, delayMs = 0) {
+  await turnsQueue().add("callback", job, {
+    delay: delayMs,
+    jobId: `cb-${job.callbackId}-${key}`,
     removeOnComplete: { count: 2000 },
     removeOnFail: { count: 5000 },
   });

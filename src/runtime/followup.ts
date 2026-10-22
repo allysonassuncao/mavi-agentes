@@ -66,6 +66,11 @@ export async function processFollowup(conversationId: string, step: number): Pro
     select role from public.messages where conversation_id = ${conv.id} and role in ('user', 'assistant') order by id desc limit 1`;
   if (last?.role === "user") return stop();
   if (!(await conversationAiOn(conv.external_id))) return stop();
+  // Retorno combinado marcado: a régua espera por ele (se configurado assim).
+  if (spec.callbacks?.enabled && spec.callbacks.followup.during === "pause") {
+    const [cb] = await sql`select 1 from public.agent_callbacks where conversation_id = ${conv.id} and status = 'scheduled' limit 1`;
+    if (cb) return stop();
+  }
   if (fu.skip_if_meeting) {
     const [m] = await sql`select 1 from public.agent_meetings where conversation_id = ${conv.id} and status = 'scheduled' and ends_at > now() limit 1`;
     if (m) return stop();

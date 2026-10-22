@@ -17,6 +17,7 @@ import type { ActionDebug } from "../integrations/debug.js";
 import { spLabel } from "../integrations/time.js";
 import { finishScenario, runScenario, SCENARIO_TOOL, scenarioTool, type ScenarioHit } from "./scenarios.js";
 import { builtinTools, formatResults, RefRegistry, REPLY_TOOL } from "./tools.js";
+import { CALLBACK_TOOLS, callbackLine, callbacksOn, callbackTools, pendingCallback, runCallbackTool, turnOffAi, type CallbackHit } from "./callbacks.js";
 
 /**
  * Uma "vez" do agente: pega as mensagens do lead ainda sem resposta, entende as
@@ -249,19 +250,21 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
           summary: spec.memory.summary ? conv.summary : "",
           retrieved: retrievedForPrompt,
           meeting: await meetingLine(conv.id),
+          callback: callbacksOn(spec) ? await pendingCallback(conv.id).then((c) => (c ? callbackLine(c) : null)) : null,
         }),
     });
 
     // 5. LLM + ferramentas
     tm = Date.now();
     const sc = scenarioTool(spec);
-    const tools = [...builtinTools(spec), ...integrationTools(spec), ...(sc ? [sc] : [])];
+    const tools = [...builtinTools(spec), ...integrationTools(spec), ...(sc ? [sc] : []), ...callbackTools(spec)];
     // O que as integrações precisam saber da conversa (MakeCRM, contato, resumo).
     const ictx = await integrationCtx(conv, spec);
     let reply: ReplyMessage[] | null = null;
     let silentReason: string | undefined;
     let handoff: string | undefined;
     let scenario: ScenarioHit | undefined;
+    const callbackHits: CallbackHit[] = [];
     let gaps: GapDraft[] = [];
     let rounds = 0;
     let usedModel = model;
@@ -348,7 +351,12 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
             break;
           }
           default:
-            if (INTEGRATION_TOOL_NAMES.has(call.function.name)) {
+            if (CALLBACK_TOOLS.has(call.function.name)) {
+              const r = await runCallbackTool(call.function.name, args, ictx, turnId);
+              result = r.result;
+              debug = r.debug;
+              if (r.hit) callbackHits.push(r.hit);
+            } else if (INTEGRATION_TOOL_NAMES.has(call.function.name)) {
               const r = await runIntegrationTool(call.function.name, args, ictx);
               result = r.result;
               debug = r.debug;
@@ -452,6 +460,12 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
     }
     // Depois do envio: desliga a IA na conversa (se o cenário pedir), nota privada e registro.
     if (scenario) await finishScenario(scenario, ictx, turnId).catch((e) => log.warn({ err: String(e) }, "turn: cenário não concluído"));
+    // Retorno com "desligar a IA" nas ações: depois do envio, como nos cenários.
+    if (live && callbackHits.some((h) => h.turnOffAi)) {
+      const done: string[] = [];
+      await turnOffAi(ictx, done);
+      callbackHits.push({ note: `Retorno combinado: ${done.join("; ") || "desligar a MAVI"}.`, turnOffAi: false });
+    }
     timings.send = Date.now() - tm;
     timings.total = Date.now() - t0;
 
@@ -468,6 +482,8 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
       if (handoff) {
         await tx`insert into public.messages (conversation_id, role, content, turn_id) values (${conv.id}, 'note', ${`Transferido para a equipe: ${handoff}`}, ${turnId})`;
       }
+      for (const h of callbackHits)
+        await tx`insert into public.messages (conversation_id, role, content, turn_id) values (${conv.id}, 'note', ${h.note.slice(0, 2000)}, ${turnId})`;
       if (scenario) {
         const note = `Cenário "${scenario.scenario.name}"${scenario.reason ? ` (${scenario.reason})` : ""}: ${scenario.done.join("; ") || "—"}`;
         await tx`insert into public.messages (conversation_id, role, content, turn_id) values (${conv.id}, 'note', ${note.slice(0, 2000)}, ${turnId})`;
@@ -493,7 +509,11 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
     // A régua de follow-up começa a contar a partir desta resposta (sem resposta ou passando para a equipe: não).
     const fu = spec.followup;
     const stopFollowup = !!scenario && (scenario.scenario.actions.stop_followup || scenario.scenario.actions.turn_off_ai);
-    if (live && status === "done" && !handoff && !stopFollowup && fu?.enabled && fu.steps.length) {
+    // Retorno combinado marcado: a régua espera por ele (se configurado assim).
+    const waitCallback = live && callbacksOn(spec) && spec.callbacks.followup.during === "pause" && !!(await pendingCallback(conv.id));
+    if (live && waitCallback) {
+      await sql`update public.conversations set followup_next_at = null, followup_state = 'idle' where id = ${conv.id}`;
+    } else if (live && status === "done" && !handoff && !stopFollowup && fu?.enabled && fu.steps.length) {
       await sql`
         update public.conversations set followup_step = 0, followup_state = 'active',
           followup_next_at = now() + make_interval(mins => ${fu.steps[0]!.after_minutes})

@@ -28,6 +28,8 @@ export const ACTIONABLE_CODES = new Set([
   "no_permission",
   "reminder_no_template",
   "reminder_failed",
+  "callback_no_template",
+  "callback_failed",
   "error",
 ]);
 

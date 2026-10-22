@@ -60,6 +60,7 @@ export async function simulateRoutes(app: FastifyInstance) {
       returning id, activated_at`;
     if (body.reset) {
       await sql`delete from public.messages where conversation_id = ${conv!.id}`;
+      await sql`delete from public.agent_callbacks where conversation_id = ${conv!.id}`;
       await sql`update public.conversations set summary = '', summary_upto = null, facts = '{}', activated_at = null where id = ${conv!.id}`;
       conv!.activated_at = null;
     }
@@ -153,7 +154,8 @@ export async function simulateRoutes(app: FastifyInstance) {
     const conversations = await db()`
       select id, external_id, phone, contact_name, facts, summary, last_inbound_at, last_reply_at, created_at,
              memory_reset_at, memory_reset_by, activated_at,
-             (select count(*) from public.messages m where m.conversation_id = c.id and m.role in ('user', 'assistant'))::int as messages
+             (select count(*) from public.messages m where m.conversation_id = c.id and m.role in ('user', 'assistant'))::int as messages,
+             (select k.due_at from public.agent_callbacks k where k.conversation_id = c.id and k.status = 'scheduled' limit 1) as callback_at
       from public.conversations c where c.agent_id = ${a.id} and not c.simulation
         and (${like}::text is null or c.contact_name ilike ${like} or (${digits} <> '' and regexp_replace(coalesce(c.phone, ''), '\\D', '', 'g') like ${`%${digits}%`}))
       order by coalesce(c.last_inbound_at, c.created_at) desc limit ${Math.min(Number(q.limit) || 50, 200)}`;
@@ -198,7 +200,8 @@ export async function simulateRoutes(app: FastifyInstance) {
       )
       select g.lead_key, g.last_at, g.first_at, g.conversations, g.contact_name, g.phone,
              lm.role as last_role, lm.content as last_content, coalesce(st.messages, 0) as messages,
-             coalesce(t.replies, 0) as replies, coalesce(t.errors, 0) as errors, coalesce(t.cost_usd, 0) as cost_usd
+             coalesce(t.replies, 0) as replies, coalesce(t.errors, 0) as errors, coalesce(t.cost_usd, 0) as cost_usd,
+             (select min(k.due_at) from public.agent_callbacks k where k.conversation_id = any (g.ids) and k.status = 'scheduled') as callback_at
       from g
       left join lateral (
         select m.role, m.content from public.messages m
@@ -243,6 +246,9 @@ export async function simulateRoutes(app: FastifyInstance) {
         const [m] = await tx<{ n: number }[]>`
           with d as (delete from public.messages where conversation_id = ${cid} returning 1) select count(*)::int as n from d`;
         await tx`delete from public.conversation_insights where conversation_id = ${cid}`;
+        await tx`
+          update public.agent_callbacks set status = 'canceled', canceled_reason = 'memória do agente zerada', canceled_by = ${by}, updated_at = now()
+          where conversation_id = ${cid} and status = 'scheduled'`;
         await tx`
           update public.conversations set summary = '', summary_upto = null, facts = '{}',
             followup_step = 0, followup_state = 'idle', followup_next_at = null,

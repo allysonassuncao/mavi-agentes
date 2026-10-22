@@ -14,6 +14,7 @@ import { integrationCheckRoutes } from "./routes/integration-checks.js";
 import { knowledgeRoutes } from "./routes/knowledge.js";
 import { secretRoutes } from "./routes/secrets.js";
 import { simulateRoutes } from "./routes/simulate.js";
+import { callbackRoutes } from "./routes/callbacks.js";
 
 export async function buildServer() {
   const app = Fastify({ loggerInstance: log, bodyLimit: 5 * 1024 * 1024, trustProxy: true, disableRequestLogging: true });
@@ -49,6 +50,7 @@ export async function buildServer() {
     await admin.register(costRoutes);
     await admin.register(testRoutes);
     await admin.register(integrationCheckRoutes);
+    await admin.register(callbackRoutes);
   });
 
   return app;

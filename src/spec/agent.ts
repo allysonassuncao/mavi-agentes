@@ -38,6 +38,7 @@ import { Integration } from "./integrations.js";
 import { Followup } from "./followup.js";
 import { Scenarios } from "./scenarios.js";
 import { MeetingReminders } from "./reminders.js";
+import { Callbacks } from "./callbacks.js";
 
 export const Instructions = z
   .object({
@@ -183,6 +184,8 @@ export const AgentSpec = z
     followup: Followup.nullable().default(null),
     /** Régua de pré-reunião: mensagens antes e depois das reuniões marcadas pelo agente. */
     meeting_reminders: MeetingReminders.nullable().default(null),
+    /** Retornos combinados: o lead pede para ser chamado depois e o agente retoma na hora. */
+    callbacks: Callbacks.nullable().default(null),
     tools: z.array(ToolRef).max(40).default([]),
     automations: z.array(z.record(z.string(), z.unknown())).max(40).default([]),
   })
