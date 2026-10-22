@@ -9,7 +9,7 @@ import { runTurn, type TurnResult } from "../../runtime/turn.js";
 import { parseSpec, type AgentSpec } from "../../spec/agent.js";
 import { assertUuid, HttpError, notFound, parseBody } from "../http.js";
 import { canCompany } from "../auth.js";
-import { loadAgent } from "./agents.js";
+import { loadAgent, ModelDefaults, withModelDefaults } from "./agents.js";
 
 /** A trava por conversa do worker (worker.ts): uma coisa por vez na conversa. */
 const convLockKey = (id: string) => `conv:lock:${id}`;
@@ -27,6 +27,8 @@ const Simulate = z.object({
   reset: z.boolean().default(false),
   contact_name: z.string().max(120).optional(),
   facts: z.record(z.string(), z.string()).optional(),
+  /** O padrão do Painel da MAVI para o rascunho (a versão publicada já vem com o dela). */
+  ...ModelDefaults,
 });
 
 export async function simulateRoutes(app: FastifyInstance) {
@@ -40,7 +42,7 @@ export async function simulateRoutes(app: FastifyInstance) {
     if (body.use === "draft") {
       const r = parseSpec(a.draft);
       if (!r.ok) throw new HttpError(422, "O rascunho tem campos inválidos.", r.errors);
-      spec = r.spec;
+      spec = withModelDefaults(r.spec, body);
     } else {
       version = body.use === "published" ? a.published_version : body.use;
       if (!version) throw new HttpError(400, "O agente ainda não tem versão publicada.");

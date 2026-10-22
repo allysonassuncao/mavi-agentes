@@ -68,6 +68,15 @@ const Draft = z.object({
 });
 
 const PricingIn = z.object({ input: z.number().min(0).max(1000), output: z.number().min(0).max(1000), cached: z.number().min(0).max(1000).nullable().optional() });
+/**
+ * O modelo padrão (e reserva) e os preços de quem constrói (o Painel da MAVI):
+ * na publicação e, para o rascunho, no Testar e nos leads simulados.
+ */
+export const ModelDefaults = {
+  default_model: z.string().trim().min(1).max(160).optional(),
+  default_fallback: z.string().trim().min(1).max(160).optional(),
+  pricing: z.record(z.string(), PricingIn).optional(),
+};
 const Publish = z.object({
   note: z.string().max(500).default(""),
   published_by: z.string().max(200).optional(),
@@ -77,9 +86,7 @@ const Publish = z.object({
    * Quem constrói pode completar a versão: o modelo padrão (e reserva) quando
    * o rascunho deixa no padrão, e o preço de cada modelo ("<provedor>:<modelo>").
    */
-  default_model: z.string().trim().min(1).max(160).optional(),
-  default_fallback: z.string().trim().min(1).max(160).optional(),
-  pricing: z.record(z.string(), PricingIn).optional(),
+  ...ModelDefaults,
 });
 
 /** Completa a versão com o padrão e os preços vindos de quem constrói. */

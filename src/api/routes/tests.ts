@@ -5,7 +5,7 @@ import { scheduleTestRun } from "../../queue.js";
 import { parseSpec } from "../../spec/agent.js";
 import { PROFILES, stopRun } from "../../tests/runner.js";
 import { assertUuid, HttpError, notFound, parseBody } from "../http.js";
-import { loadAgent } from "./agents.js";
+import { loadAgent, ModelDefaults, withModelDefaults } from "./agents.js";
 
 /**
  * Testes com leads simulados: começar uma bateria (rascunho, publicada ou uma
@@ -25,6 +25,8 @@ const Start = z.object({
   profiles: z.array(z.string().max(40)).max(20).default([]),
   focus: z.string().max(1000).default(""),
   created_by: z.string().max(200).optional(),
+  /** O padrão do Painel da MAVI para o rascunho (a versão publicada já vem com o dela). */
+  ...ModelDefaults,
 });
 
 export async function testRoutes(app: FastifyInstance) {
@@ -39,7 +41,7 @@ export async function testRoutes(app: FastifyInstance) {
       if (use === "draft") {
         const r = parseSpec(a.draft);
         if (!r.ok) throw new HttpError(422, "O rascunho tem campos inválidos: corrija antes de testar.", r.errors);
-        return { spec: r.spec, version: null as number | null };
+        return { spec: withModelDefaults(r.spec, body), version: null as number | null };
       }
       const version = use === "published" ? a.published_version : use;
       if (!version) throw new HttpError(400, "O agente ainda não tem versão publicada.");
