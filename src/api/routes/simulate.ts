@@ -27,6 +27,15 @@ const Simulate = z.object({
   reset: z.boolean().default(false),
   contact_name: z.string().max(120).optional(),
   facts: z.record(z.string(), z.string()).optional(),
+  /**
+   * Reencenar um trecho de conversa: com reset, a conversa de teste começa com
+   * estas mensagens (já respondidas, como histórico) e a "message" é a próxima
+   * do lead. O teste antes × depois do Ajustar com a MAVI usa.
+   */
+  history: z
+    .array(z.object({ role: z.enum(["user", "assistant"]), content: z.string().trim().min(1).max(4000) }).strict())
+    .max(40)
+    .optional(),
   /** O padrão do Painel da MAVI para o rascunho (a versão publicada já vem com o dela). */
   ...ModelDefaults,
 });
@@ -63,6 +72,14 @@ export async function simulateRoutes(app: FastifyInstance) {
       await sql`delete from public.agent_callbacks where conversation_id = ${conv!.id}`;
       await sql`update public.conversations set summary = '', summary_upto = null, facts = '{}', activated_at = null where id = ${conv!.id}`;
       conv!.activated_at = null;
+    }
+    if (body.reset && body.history?.length) {
+      // As mensagens de antes entram como já respondidas (uma "vez" só para elas); o gatilho conta como já ativado.
+      const replay = randomUUID();
+      for (const h of body.history)
+        await sql`insert into public.messages (conversation_id, role, content, turn_id) values (${conv!.id}, ${h.role}, ${h.content}, ${replay})`;
+      await sql`update public.conversations set activated_at = now() where id = ${conv!.id}`;
+      conv!.activated_at = new Date();
     }
     if (body.facts) await sql`update public.conversations set facts = facts || ${sql.json(body.facts)} where id = ${conv!.id}`;
     const contentType = MEDIA_TYPES.has(body.content_type) && body.media_url ? body.content_type : "text";
