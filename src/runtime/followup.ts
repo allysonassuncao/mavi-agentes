@@ -5,7 +5,8 @@ import { addPrivateNote } from "../integrations/deals.js";
 import { hmToMin, spDayKey, spMinutes, spYmd, addDays, spDate } from "../integrations/time.js";
 import { chatWithFallback, type ChatMessage } from "../llm/client.js";
 import { log } from "../log.js";
-import { conversationAiOn, inboxType, listTemplates, rest, sendMessage, sendTemplate, wabaWindowOpen } from "../makecrm/client.js";
+import { conversationAiOn, inboxType, listTemplates, rest, sendTemplate, wabaWindowOpen } from "../makecrm/client.js";
+import { deliverMessage } from "./deliver.js";
 import { agentKeys } from "../secrets.js";
 import { categoryOf, countryOf, recordCost, wabaPrice } from "../costs/ledger.js";
 import type { FollowupStepT, FollowupT } from "../spec/followup.js";
@@ -168,7 +169,7 @@ export async function processFollowup(conversationId: string, step: number): Pro
     if (!closed) {
       for (let i = 0; i < texts.length; i++) {
         if (i > 0) await new Promise((r) => setTimeout(r, typingDelayMs(texts[i]!)));
-        await sendMessage({ companyId: conv.company_id, userId: conv.mavi_user_id, conversationId: conv.external_id, content: texts[i]! });
+        await deliverMessage({ companyId: conv.company_id, userId: conv.mavi_user_id, conversationId: conv.external_id, content: texts[i]! });
       }
     }
   } catch (e) {

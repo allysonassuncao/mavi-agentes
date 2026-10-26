@@ -69,7 +69,7 @@ export async function integrationCheckRoutes(app: FastifyInstance) {
     const days = Math.min(Math.max(Number(q.days) || 7, 1), 90);
     const limit = Math.min(Math.max(Number(q.limit) || 50, 10), 100);
     const before = q.before && !Number.isNaN(Date.parse(q.before)) ? new Date(q.before) : null;
-    const tools = q.tools ? q.tools.split(",").map((t) => t.trim()).filter((t) => /^[a-z_]{2,40}$/.test(t)).slice(0, 20) : null;
+    const tools = q.tools ? q.tools.split(",").map((t) => t.trim()).filter((t) => /^[a-z][a-z0-9_]{1,43}$/.test(t)).slice(0, 20) : null;
     const outcome = q.outcome && /^(ok|empty|blocked|error|simulated)$/.test(q.outcome) ? q.outcome : null;
     const conversation = q.conversation && /^[0-9a-f-]{36}$/i.test(q.conversation) ? q.conversation : null;
     const sql = db();

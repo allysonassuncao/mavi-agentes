@@ -18,6 +18,7 @@ import {
 import { parseSpec, type AgentSpec } from "../../spec/agent.js";
 import { cleanFilters, conversationIds, historyFilters, historyPage } from "../../makecrm/history.js";
 import { canCompany } from "../auth.js";
+import { webchatTypeId } from "../../webchat/makecrm.js";
 import { assertUuid, HttpError, notFound, parseBody } from "../http.js";
 
 type AgentRow = {
@@ -156,7 +157,7 @@ export async function agentRoutes(app: FastifyInstance) {
           where agent_id = ${a.id} and version = ${a.published_version}`
       : [];
     const bindings = await db()`
-      select id, inbox_id, inbox_name, enabled, created_by, created_at from public.bindings
+      select id, inbox_id, inbox_name, enabled, created_by, created_at, channel from public.bindings
       where agent_id = ${a.id} and removed_at is null order by created_at`;
     return { agent: a, draft_validation: validation(a.draft), published: published ?? null, bindings };
   });
@@ -358,17 +359,20 @@ export async function agentRoutes(app: FastifyInstance) {
     const body = parseBody(Bind, req.body);
     const inbox = await getInbox(body.inbox_id);
     if (!inbox || inbox.company_id !== a.company_id) throw new HttpError(400, "Caixa não encontrada nesta empresa do MakeCRM.");
-    if (inbox.type_id !== 1 && inbox.type_id !== 2) throw new HttpError(400, "Por enquanto só caixas de WhatsApp.");
+    // Chat do site: o motor recebe as mensagens direto do widget (sem o Go nem o webhook da caixa).
+    const webchat = inbox.type_id === (await webchatTypeId().catch(() => -1));
+    if (inbox.type_id !== 1 && inbox.type_id !== 2 && !webchat) throw new HttpError(400, "Só caixas de WhatsApp ou do Chat do site.");
     const [taken] = await db()<{ agent_id: string }[]>`
       select agent_id from public.bindings where inbox_id = ${inbox.id} and removed_at is null`;
     if (taken) throw new HttpError(409, taken.agent_id === a.id ? "Esta caixa já está ligada a este agente." : "Esta caixa já está ligada a outro agente.");
 
     const token = newToken("in_");
-    const previous = await getInboxWebhook(inbox.id);
+    const previous = webchat ? null : await getInboxWebhook(inbox.id);
     const [binding] = await db()`
-      insert into public.bindings (agent_id, company_id, inbox_id, inbox_name, token_hash, previous_webhook_url, created_by)
-      values (${a.id}, ${a.company_id}, ${inbox.id}, ${inbox.name}, ${sha256(token)}, ${previous}, ${body.created_by ?? req.client!.name})
-      returning id, inbox_id, inbox_name, enabled, created_at`;
+      insert into public.bindings (agent_id, company_id, inbox_id, inbox_name, token_hash, previous_webhook_url, created_by, channel)
+      values (${a.id}, ${a.company_id}, ${inbox.id}, ${inbox.name}, ${sha256(token)}, ${previous}, ${body.created_by ?? req.client!.name}, ${webchat ? "webchat" : "whatsapp"})
+      returning id, inbox_id, inbox_name, enabled, created_at, channel`;
+    if (webchat) return reply.code(201).send({ binding, previous_webhook_url: null, warnings: [] });
     try {
       await setInboxWebhook(inbox.id, inboundUrl(token));
     } catch (e) {
@@ -406,10 +410,10 @@ export async function agentRoutes(app: FastifyInstance) {
 
 /** Desfaz a ligação: a caixa volta para o endereço que tinha antes (ou fica sem IA). */
 async function unbind(bindingId: string): Promise<string | null> {
-  const [b] = await db()<{ inbox_id: string; previous_webhook_url: string | null }[]>`
+  const [b] = await db()<{ inbox_id: string; previous_webhook_url: string | null; channel: string }[]>`
     update public.bindings set removed_at = now(), enabled = false where id = ${bindingId} and removed_at is null
-    returning inbox_id, previous_webhook_url`;
-  if (!b) return null;
+    returning inbox_id, previous_webhook_url, channel`;
+  if (!b || b.channel === "webchat") return null;
   // Não devolve para outro endereço deste motor (ligação antiga já desfeita).
   const back = b.previous_webhook_url && !b.previous_webhook_url.includes("/v1/inbound/makecrm/") ? b.previous_webhook_url : null;
   await setInboxWebhook(b.inbox_id, back);

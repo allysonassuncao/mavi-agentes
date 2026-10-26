@@ -4,7 +4,9 @@ import { searchKnowledge, type Retrieved } from "../knowledge/search.js";
 import { signedUrl } from "../knowledge/storage.js";
 import { addUsage, chatWithFallback, chat, emptyUsage, type ChatMessage, type Usage } from "../llm/client.js";
 import { log } from "../log.js";
-import { handOffToHuman, sendMessage, type OutgoingAttachment } from "../makecrm/client.js";
+import { handOffToHuman, type OutgoingAttachment } from "../makecrm/client.js";
+import { deliverMessage, typingKey } from "./deliver.js";
+import { redis } from "../redis.js";
 import { parseSpec, type AgentSpec } from "../spec/agent.js";
 import { understandMedia } from "./media.js";
 import { agentKeys } from "../secrets.js";
@@ -17,6 +19,9 @@ import type { ActionDebug } from "../integrations/debug.js";
 import { spLabel } from "../integrations/time.js";
 import { finishScenario, runScenario, SCENARIO_TOOL, scenarioTool, type ScenarioHit } from "./scenarios.js";
 import { builtinTools, formatResults, RefRegistry, REPLY_TOOL } from "./tools.js";
+import { apiOf, apiTools, isApiTool, runApiTool, runStartApis, startContextLines, type StartContext } from "../integrations/apis.js";
+import { recordFailure } from "../integrations/index.js";
+import { runSiteTool, SITE_TOOLS, siteChannel } from "../webchat/agent.js";
 import { CALLBACK_TOOLS, callbackLine, callbacksOn, callbackTools, pendingCallback, runCallbackTool, turnOffAi, type CallbackHit } from "./callbacks.js";
 
 /**
@@ -34,7 +39,15 @@ const MAX_ROUNDS = 6;
 const SUPERSEDE_MAX_MS = 90_000;
 
 /** Ferramentas sem efeito fora da conversa: a resposta pode ser descartada e refeita. */
-const SAFE_TO_REDO = new Set([REPLY_TOOL, "buscar_conhecimento", "registrar_dados_do_contato", "transferir_para_humano", "agenda_horarios_livres"]);
+const SAFE_TO_REDO = new Set([
+  REPLY_TOOL,
+  "buscar_conhecimento",
+  "registrar_dados_do_contato",
+  "transferir_para_humano",
+  "agenda_horarios_livres",
+  "registrar_contato_do_site",
+  "link_do_whatsapp",
+]);
 
 /** Chegou mensagem do lead depois das que esta vez está respondendo? */
 async function newerLeadMessage(conversationId: string, afterId: string): Promise<boolean> {
@@ -58,6 +71,7 @@ export type ConversationRow = {
   summary: string;
   summary_upto: string | null;
   facts: Record<string, unknown>;
+  api_context: StartContext | null;
 };
 
 type MessageRow = {
@@ -232,6 +246,16 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
     retrievedLog = prefetch.map((r) => ({ ref: reg.add(r), chunk_id: r.chunk_id, kind: r.kind, title: r.title, score: r.score, via: "prefetch" }));
     timings.retrieval = Date.now() - tm;
 
+    // 3b. APIs do começo da conversa (uma vez por conversa; o resultado vira contexto)
+    const startApis = await runStartApis(spec, { ...conv, contactName: conv.contact_name });
+    for (const d of startApis.debug) toolLog.push({ name: d.name, args: { momento: "começo da conversa" }, result: d.result, ms: 0, debug: d.debug });
+
+    // 3c. Chat do site: o canal, os dados do visitante e as ferramentas dele
+    const site = await siteChannel(conv).catch((e) => {
+      log.warn({ err: String(e) }, "turn: canal do site não lido");
+      return null;
+    });
+
     // 4. Mensagens para o LLM
     const messages: ChatMessage[] = [{ role: "system", content: buildSystemPrompt(spec) }];
     for (const h of history) {
@@ -251,13 +275,15 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
           retrieved: retrievedForPrompt,
           meeting: await meetingLine(conv.id),
           callback: callbacksOn(spec) ? await pendingCallback(conv.id).then((c) => (c ? callbackLine(c) : null)) : null,
+          apis: startContextLines(startApis.context),
+          channel: site?.line ?? null,
         }),
     });
 
     // 5. LLM + ferramentas
     tm = Date.now();
     const sc = scenarioTool(spec);
-    const tools = [...builtinTools(spec), ...integrationTools(spec), ...(sc ? [sc] : []), ...callbackTools(spec)];
+    const tools = [...builtinTools(spec), ...integrationTools(spec), ...apiTools(spec), ...(site?.tools ?? []), ...(sc ? [sc] : []), ...callbackTools(spec)];
     // O que as integrações precisam saber da conversa (MakeCRM, contato, resumo).
     const ictx = await integrationCtx(conv, spec);
     let reply: ReplyMessage[] | null = null;
@@ -356,6 +382,15 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
               result = r.result;
               debug = r.debug;
               if (r.hit) callbackHits.push(r.hit);
+            } else if (site && SITE_TOOLS.has(call.function.name)) {
+              const r = await runSiteTool(site, call.function.name, args);
+              result = r.result;
+              debug = r.debug;
+            } else if (isApiTool(call.function.name)) {
+              const r = await runApiTool(call.function.name, args, ictx);
+              result = r.result;
+              debug = r.debug;
+              if (r.failure) await recordFailure(call.function.name, r.failure, ictx).catch((e) => log.warn({ err: String(e) }, "turn: falha da API não registrada"));
             } else if (INTEGRATION_TOOL_NAMES.has(call.function.name)) {
               const r = await runIntegrationTool(call.function.name, args, ictx);
               result = r.result;
@@ -385,7 +420,8 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
     // no rastro, com o custo) e a próxima vez responde a tudo de uma vez.
     const lastPendingId = pending[pending.length - 1]!.id;
     // Se já marcou reunião, moveu oportunidade etc., não refaz (repetiria a ação): envia.
-    const redoable = toolLog.every((t) => SAFE_TO_REDO.has(t.name));
+    // Consultas a APIs externas também podem ser refeitas; as que enviam dados, não.
+    const redoable = toolLog.every((t) => SAFE_TO_REDO.has(t.name) || (isApiTool(t.name) && apiOf(spec, t.name)?.kind !== "write"));
     if (
       live &&
       redoable &&
@@ -435,7 +471,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
             interrupted = true;
             break;
           }
-          await sendMessage({
+          await deliverMessage({
             companyId: conv.company_id,
             userId: conv.mavi_user_id,
             conversationId: conv.external_id,
@@ -468,6 +504,8 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
     }
     timings.send = Date.now() - tm;
     timings.total = Date.now() - t0;
+    // Chat do site: o "escrevendo" some (mesmo sem resposta).
+    if (live && site) await redis().del(typingKey(conv.external_id)).catch(() => {});
 
     // 8. Registro
     const status = reply.length ? "done" : "silent";

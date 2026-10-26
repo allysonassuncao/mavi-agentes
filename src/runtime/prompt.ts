@@ -183,14 +183,20 @@ export function contextBlock(input: {
   meeting?: string | null;
   /** O retorno combinado com este lead (data, pedido, o que retomar). */
   callback?: string | null;
+  /** O que as APIs externas trouxeram no começo da conversa. */
+  apis?: string[];
+  /** Chat do site: o canal e o que fazer com os dados do visitante. */
+  channel?: string | null;
 }): string {
   const lines: string[] = [`Agora: ${nowInBrazil(input.now)}`];
+  if (input.channel) lines.push(input.channel);
   const who = [input.contactName && `nome no WhatsApp: ${input.contactName}`, input.phone && `telefone: ${input.phone}`].filter(Boolean);
   if (who.length) lines.push(`Contato: ${who.join(", ")}`);
   const facts = Object.entries(input.facts).filter(([, v]) => v !== null && v !== "");
   if (facts.length) lines.push(`Dados já registrados do contato: ${facts.map(([k, v]) => `${k}: ${String(v)}`).join("; ")}`);
   if (input.meeting) lines.push(`Reunião marcada com este lead: ${input.meeting}`);
   if (input.callback) lines.push(`Retorno combinado com este lead: ${input.callback}`);
+  if (input.apis?.length) lines.push(`Dados de outros sistemas da empresa (consultados no começo da conversa):\n${input.apis.map((a) => `- ${a}`).join("\n")}`);
   if (input.summary.trim()) lines.push(`Resumo das mensagens anteriores:\n${input.summary.trim()}`);
   if (input.retrieved.length) {
     lines.push(

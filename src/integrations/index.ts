@@ -25,6 +25,7 @@ import { activeDeals, addPrivateNote, addStory, userNames, type Deal } from "./d
 import { activityAssignee, addNote, catalogProduct, conversationDeals, createActivity, createQuote, mainDeal, markLost, markWon } from "./deal-actions.js";
 import { blockedDebug, blockedMessage, claimRepeat, withRepeat } from "./repeat.js";
 import { CALENDAR_FIX, type ActionDebug } from "./debug.js";
+import { ApiCallError } from "./apis.js";
 import { availableUsers, commitRotation, pickUser, rotationOrder } from "./rotation.js";
 import { addDays, spLabel, spYmd } from "./time.js";
 
@@ -319,6 +320,7 @@ const INTEGRATION_LABEL: Record<string, string> = {
   makecrm_change_owner: "Trocar responsável",
   team_notify: "Avisar a equipe",
   makecrm_deal_actions: "Ações na oportunidade",
+  external_api: "APIs externas",
 };
 /** Uma falha avisa a equipe no máximo uma vez a cada 6 horas (por agente, integração e motivo). */
 const NOTIFY_EVERY_HOURS = 6;
@@ -329,8 +331,8 @@ const NOTIFY_EVERY_HOURS = 6;
  */
 export async function recordFailure(tool: string, e: unknown, ctx: IntegrationCtx): Promise<void> {
   if (ctx.simulation) return;
-  const integration = INTEGRATION_OF[tool] ?? tool;
-  const code = e instanceof CalendarError ? e.code : "error";
+  const integration = INTEGRATION_OF[tool] ?? (tool.startsWith("api_") ? "external_api" : tool);
+  const code = e instanceof CalendarError || e instanceof ApiCallError ? e.code : "error";
   const message = (e instanceof Error ? e.message : String(e)).slice(0, 2000);
   const sql = db();
   const [recent] = await sql<{ n: number }[]>`
@@ -345,7 +347,7 @@ export async function recordFailure(tool: string, e: unknown, ctx: IntegrationCt
   if (willNotify)
     await sendTeamNotice(
       notify!,
-      `⚠️ A integração ${INTEGRATION_LABEL[integration] ?? integration} falhou nesta conversa: ${message}\nO agente disse ao lead que a equipe vai confirmar. Corrija em MAVI Tasks › Agentes MAVI › Integrações.`,
+      `⚠️ A integração ${INTEGRATION_LABEL[integration] ?? integration} falhou nesta conversa: ${message}\nO agente disse ao lead que a equipe vai confirmar. Corrija em MAVI Tasks › Agentes MAVI › ${integration === "external_api" ? "APIs externas" : "Integrações"}.`,
       ctx,
     );
 }

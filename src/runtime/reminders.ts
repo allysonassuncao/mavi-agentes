@@ -7,7 +7,8 @@ import { sendTeamNotice } from "../integrations/index.js";
 import { spLabel, spMinutes, spYmd } from "../integrations/time.js";
 import { chatWithFallback, type ChatMessage } from "../llm/client.js";
 import { log } from "../log.js";
-import { conversationAiOn, inboxType, listTemplates, sendMessage, sendTemplate, wabaWindowOpen } from "../makecrm/client.js";
+import { conversationAiOn, inboxType, listTemplates, sendTemplate, wabaWindowOpen } from "../makecrm/client.js";
+import { deliverMessage } from "./deliver.js";
 import { agentKeys } from "../secrets.js";
 import type { MeetingRemindersT, ReminderStepT } from "../spec/reminders.js";
 import type { TeamNotifyConfig } from "../spec/integrations.js";
@@ -215,7 +216,7 @@ export async function processReminder(meetingId: string, stepId: string, startsA
     if (!closed)
       for (let i = 0; i < texts.length; i++) {
         if (i > 0) await new Promise((r) => setTimeout(r, typingDelayMs(texts[i]!)));
-        await sendMessage({ companyId: conv.company_id, userId: conv.mavi_user_id, conversationId: conv.external_id, content: texts[i]! });
+        await deliverMessage({ companyId: conv.company_id, userId: conv.mavi_user_id, conversationId: conv.external_id, content: texts[i]! });
       }
   } catch (e) {
     const err = e instanceof Error ? e.message : String(e);

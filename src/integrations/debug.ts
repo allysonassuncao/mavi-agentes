@@ -30,6 +30,14 @@ export const ACTIONABLE_CODES = new Set([
   "reminder_failed",
   "callback_no_template",
   "callback_failed",
+  "api_auth",
+  "api_not_found",
+  "api_rejected",
+  "api_server",
+  "api_timeout",
+  "api_network",
+  "api_no_key",
+  "api_invalid",
   "error",
 ]);
 

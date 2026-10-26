@@ -15,6 +15,8 @@ import { knowledgeRoutes } from "./routes/knowledge.js";
 import { secretRoutes } from "./routes/secrets.js";
 import { simulateRoutes } from "./routes/simulate.js";
 import { callbackRoutes } from "./routes/callbacks.js";
+import { apiRoutes } from "./routes/apis.js";
+import { webchatAdminRoutes, webchatPublicRoutes } from "./routes/webchat.js";
 
 export async function buildServer() {
   const app = Fastify({ loggerInstance: log, bodyLimit: 5 * 1024 * 1024, trustProxy: true, disableRequestLogging: true });
@@ -37,6 +39,8 @@ export async function buildServer() {
 
   // Entrada do MakeCRM: autenticada pelo token da URL.
   await app.register(inboundRoutes);
+  // Chat do site: o widget e a página do chat (públicos, com limite de uso).
+  await app.register(webchatPublicRoutes);
 
   // Administração: chave da API.
   await app.register(async (admin) => {
@@ -51,6 +55,8 @@ export async function buildServer() {
     await admin.register(testRoutes);
     await admin.register(integrationCheckRoutes);
     await admin.register(callbackRoutes);
+    await admin.register(apiRoutes);
+    await admin.register(webchatAdminRoutes);
   });
 
   return app;

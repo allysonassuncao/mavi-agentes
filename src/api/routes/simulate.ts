@@ -70,7 +70,7 @@ export async function simulateRoutes(app: FastifyInstance) {
     if (body.reset) {
       await sql`delete from public.messages where conversation_id = ${conv!.id}`;
       await sql`delete from public.agent_callbacks where conversation_id = ${conv!.id}`;
-      await sql`update public.conversations set summary = '', summary_upto = null, facts = '{}', activated_at = null where id = ${conv!.id}`;
+      await sql`update public.conversations set summary = '', summary_upto = null, facts = '{}', api_context = '{}', activated_at = null where id = ${conv!.id}`;
       conv!.activated_at = null;
     }
     if (body.reset && body.history?.length) {
@@ -267,7 +267,7 @@ export async function simulateRoutes(app: FastifyInstance) {
           update public.agent_callbacks set status = 'canceled', canceled_reason = 'memória do agente zerada', canceled_by = ${by}, updated_at = now()
           where conversation_id = ${cid} and status = 'scheduled'`;
         await tx`
-          update public.conversations set summary = '', summary_upto = null, facts = '{}',
+          update public.conversations set summary = '', summary_upto = null, facts = '{}', api_context = '{}',
             followup_step = 0, followup_state = 'idle', followup_next_at = null,
             -- Com gatilho, o lead precisa mandar o termo de novo (sem gatilho, a próxima mensagem já ativa).
             activated_at = null,
