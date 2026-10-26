@@ -24,6 +24,7 @@ import {
 import { activeDeals, addPrivateNote, addStory, userNames, type Deal } from "./deals.js";
 import { activityAssignee, addNote, catalogProduct, conversationDeals, createActivity, createQuote, mainDeal, markLost, markWon } from "./deal-actions.js";
 import { blockedDebug, blockedMessage, claimRepeat, withRepeat } from "./repeat.js";
+import type { RepeatT } from "../spec/integrations.js";
 import { CALENDAR_FIX, type ActionDebug } from "./debug.js";
 import { ApiCallError } from "./apis.js";
 import { availableUsers, commitRotation, pickUser, rotationOrder } from "./rotation.js";
@@ -761,7 +762,8 @@ async function moveDeal(cfg: MoveDealConfig, args: Record<string, unknown>, ctx:
   if (!rule) return { result: "Regra desconhecida.", silent: true };
   if (ctx.simulation) {
     const stage = await stageOf(rule.pipeline_id, rule.stage_id);
-    return { result: stage ? `Simulação: a oportunidade iria para a etapa "${stage.name}". Siga a conversa sem comentar.` : "A etapa da regra não existe mais no CRM.", silent: true };
+    if (!stage) return { result: "A etapa da regra não existe mais no CRM.", silent: true };
+    return simulated(ctx, `mv:${rule.id}`, cfg.repeat, "Mover a oportunidade por esta regra", `Simulação: a oportunidade iria para a etapa "${stage.name}". Siga a conversa sem comentar.`);
   }
   // Quantas vezes por conversa: a configuração da integração (vale para cada regra).
   return withRepeat(ctx.conversationId, `mv:${rule.id}`, cfg.repeat, "Mover a oportunidade por esta regra", async () => {
@@ -828,7 +830,7 @@ const ROLE_LABEL = { owner: "Proprietário", sdr: "SDR", closer: "Closer" } as c
 async function changeOwner(cfg: ChangeOwnerConfig, args: Record<string, unknown>, ctx: IntegrationCtx): Promise<IntegrationResult> {
   const rule = cfg.rules.find((r) => r.id === String(args.regra ?? ""));
   if (!rule) return { result: "Regra desconhecida.", silent: true };
-  if (ctx.simulation) return changeOwnerNow(rule, args, ctx);
+  if (ctx.simulation) return withRepeat(ctx.conversationId, `ow:${rule.id}`, cfg.repeat, "Trocar o responsável por esta regra", () => changeOwnerNow(rule, args, ctx));
   // Antes do rodízio: uma troca bloqueada não conta a vez de ninguém.
   return withRepeat(ctx.conversationId, `ow:${rule.id}`, cfg.repeat, "Trocar o responsável por esta regra", () => changeOwnerNow(rule, args, ctx));
 }
@@ -881,12 +883,17 @@ async function changeOwnerNow(rule: ChangeOwnerConfig["rules"][number], args: Re
   return { result: "Feito. Siga a conversa sem comentar a mudança.", silent: true, action: { type: "trocar_responsavel", rule: rule.id, chosen } };
 }
 
+/** No teste, a ação não acontece, mas a trava de repetição vale igual (cada teste é uma conversa própria). */
+function simulated(ctx: IntegrationCtx, key: string, repeat: RepeatT, what: string, result: string): Promise<IntegrationResult> {
+  return withRepeat(ctx.conversationId, key, repeat, what, async () => ({ result, silent: true as const }));
+}
+
 // ---------------------------------------------------------------- aviso à equipe
 
 async function notifyTeam(cfg: TeamNotifyConfig, args: Record<string, unknown>, ctx: IntegrationCtx): Promise<IntegrationResult> {
   const message = String(args.mensagem ?? "").trim().slice(0, 1500);
   if (!message) return { result: "Mensagem vazia.", silent: true };
-  if (ctx.simulation) return { result: `Simulação: a equipe receberia: "${message}".`, silent: true };
+  if (ctx.simulation) return simulated(ctx, "nt", cfg.repeat, "O aviso à equipe sobre este lead", `Simulação: a equipe receberia: "${message}".`);
   // Qualquer aviso do mesmo lead conta: o texto muda a cada vez que o agente escreve.
   return withRepeat(ctx.conversationId, "nt", cfg.repeat, "O aviso à equipe sobre este lead", async () => ({ ...(await sendTeamNotice(cfg, message, ctx)), silent: true as const }));
 }
@@ -940,7 +947,8 @@ async function lostTool(cfg: DealActionsConfig, args: Record<string, unknown>, c
   const reason = pick(cfg.lost.reasons, "R", args.motivo);
   if (!reason) return { result: "Motivo desconhecido.", silent: true };
   const obs = String(args.observacao ?? "").trim().slice(0, 500);
-  if (ctx.simulation) return { result: `Simulação: a oportunidade seria dada como perdida (${reason.name}). Siga a conversa sem comentar.`, silent: true };
+  if (ctx.simulation)
+    return simulated(ctx, "lost", cfg.lost.repeat, "Dar a oportunidade como perdida", `Simulação: a oportunidade seria dada como perdida (${reason.name}). Siga a conversa sem comentar.`);
   if (!ctx.makecrmConversationId) return { result: "Sem conversa no CRM.", silent: true };
   const deals = (await conversationDeals(ctx.makecrmConversationId)).filter((d) => d.status === 1);
   if (!deals.length) return NO_DEAL;
@@ -952,7 +960,8 @@ async function lostTool(cfg: DealActionsConfig, args: Record<string, unknown>, c
 
 async function wonTool(cfg: DealActionsConfig, args: Record<string, unknown>, ctx: IntegrationCtx): Promise<IntegrationResult> {
   const obs = String(args.observacao ?? "").trim().slice(0, 500);
-  if (ctx.simulation) return { result: "Simulação: a oportunidade seria dada como ganha pelos orçamentos dela. Siga a conversa sem comentar.", silent: true };
+  if (ctx.simulation)
+    return simulated(ctx, "won", cfg.won.repeat, "Dar a oportunidade como ganha", "Simulação: a oportunidade seria dada como ganha pelos orçamentos dela. Siga a conversa sem comentar.");
   if (!ctx.makecrmConversationId) return { result: "Sem conversa no CRM.", silent: true };
   const deal = await mainDeal(ctx.makecrmConversationId);
   if (!deal) return NO_DEAL;
@@ -988,7 +997,8 @@ async function quoteTool(cfg: DealActionsConfig, args: Record<string, unknown>, 
       silent: true,
     };
   const obs = String(args.observacao ?? "").trim().slice(0, 500);
-  if (ctx.simulation) return { result: `Simulação: orçamento de "${product.name}" por ${price.toFixed(2)} seria registrado. Siga a conversa sem comentar.`, silent: true };
+  if (ctx.simulation)
+    return simulated(ctx, `quote:${product.id}`, cfg.quote.repeat, "O orçamento deste produto", `Simulação: orçamento de "${product.name}" por ${price.toFixed(2)} seria registrado. Siga a conversa sem comentar.`);
   if (!ctx.makecrmConversationId) return { result: "Sem conversa no CRM.", silent: true };
   const deal = await mainDeal(ctx.makecrmConversationId);
   if (!deal) return NO_DEAL;
@@ -1001,7 +1011,7 @@ async function quoteTool(cfg: DealActionsConfig, args: Record<string, unknown>, 
 async function noteTool(cfg: DealActionsConfig, args: Record<string, unknown>, ctx: IntegrationCtx): Promise<IntegrationResult> {
   const text = String(args.texto ?? "").trim().slice(0, 2000);
   if (!text) return { result: "Texto vazio.", silent: true };
-  if (ctx.simulation) return { result: `Simulação: ficaria no histórico: "${text}".`, silent: true };
+  if (ctx.simulation) return simulated(ctx, "note", cfg.note.repeat, "A observação no histórico", `Simulação: ficaria no histórico: "${text}".`);
   if (!ctx.makecrmConversationId) return { result: "Sem conversa no CRM.", silent: true };
   const deals = await conversationDeals(ctx.makecrmConversationId, { closed: true });
   const target = deals.filter((d) => d.status === 1);
@@ -1024,7 +1034,13 @@ async function activityTool(cfg: DealActionsConfig, args: Record<string, unknown
   if (ctx.simulation) {
     const who = cfg.activity.assignee.mode === "fixed" || cfg.activity.assignee.mode === "round_robin" ? await activityAssignee(ctx, {} as Deal, cfg.activity.assignee, "activity", true) : null;
     const name = who ? (await userNames([who])).get(who) : "";
-    return { result: `Simulação: atividade "${type.name}: ${subject}" para ${spLabel(doIn)}${name ? ` com ${name}` : " com o responsável da oportunidade"}. Siga a conversa sem comentar.`, silent: true };
+    return simulated(
+      ctx,
+      `activity:${type.id}`,
+      cfg.activity.repeat,
+      `A atividade do tipo ${type.name}`,
+      `Simulação: atividade "${type.name}: ${subject}" para ${spLabel(doIn)}${name ? ` com ${name}` : " com o responsável da oportunidade"}. Siga a conversa sem comentar.`,
+    );
   }
   if (!deal) return NO_DEAL;
   return withRepeat(ctx.conversationId, `activity:${type.id}`, cfg.activity.repeat, `A atividade do tipo ${type.name}`, async () => {

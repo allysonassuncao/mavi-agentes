@@ -70,6 +70,14 @@ export async function runScenario(spec: AgentSpec, args: Record<string, unknown>
           : "Responda ao lead normalmente, de acordo com o cenário.";
 
   if (ctx.simulation) {
+    // A mesma trava de repetição do real (a conversa de teste é própria).
+    const claim = await claimRepeat(ctx.conversationId, `sc:${s.id}`, s.repeat);
+    if (!claim.ok)
+      return {
+        result: `Cenário já acionado nesta conversa: as ações não se repetem agora. ${guide}`,
+        hit: { scenario: s, reason, done: ["já acionado antes (não repetiu as ações)"], repeated: true },
+        debug: blockedDebug(claim, `Cenário "${s.name}"`, s.repeat),
+      };
     const plan = await describe(s);
     return {
       result: `Simulação: o cenário "${s.name}" faria: ${plan.join("; ") || "nada no CRM"}. ${guide}`,

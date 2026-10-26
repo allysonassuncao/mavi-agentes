@@ -5,10 +5,11 @@ import { db } from "../../db.js";
 import { redis } from "../../redis.js";
 import { MEDIA_TYPES } from "../../runtime/inbound.js";
 import { activateConversation, matchActivation, WAITING_TRIGGER } from "../../runtime/activation.js";
-import { runTurn, type TurnResult } from "../../runtime/turn.js";
+import { runTurn, type ConversationRow, type TurnResult } from "../../runtime/turn.js";
 import { parseSpec, type AgentSpec } from "../../spec/agent.js";
 import { assertUuid, HttpError, notFound, parseBody } from "../http.js";
 import { canCompany } from "../auth.js";
+import { advanceSim, simSchedule } from "../../runtime/sim-time.js";
 import { loadAgent, ModelDefaults, withModelDefaults } from "./agents.js";
 
 /** A trava por conversa do worker (worker.ts): uma coisa por vez na conversa. */
@@ -27,6 +28,9 @@ const Simulate = z.object({
   reset: z.boolean().default(false),
   contact_name: z.string().max(120).optional(),
   facts: z.record(z.string(), z.string()).optional(),
+  /** Quem está testando (fica no teste salvo) e de onde: o Testar do construtor, o antes × depois da MAVI ou outro. */
+  tester: z.string().trim().max(200).optional(),
+  origin: z.enum(["testar", "mavi", "other"]).default("other"),
   /**
    * Reencenar um trecho de conversa: com reset, a conversa de teste começa com
    * estas mensagens (já respondidas, como histórico) e a "message" é a próxima
@@ -62,10 +66,23 @@ export async function simulateRoutes(app: FastifyInstance) {
     }
 
     const sql = db();
+    // Nova conversa: o teste anterior fica salvo (encerrado, com outro código) e este começa do zero.
+    if (body.reset) {
+      const [old] = await sql<{ id: string }[]>`
+        update public.conversations set external_id = external_id || '#' || to_char(now(), 'YYYYMMDDHH24MISSMS'), ended_at = now()
+        where agent_id = ${a.id} and simulation and external_id = ${body.session}
+          and exists (select 1 from public.messages m where m.conversation_id = public.conversations.id)
+        returning id`;
+      if (old) {
+        await sql`update public.agent_callbacks set status = 'canceled', canceled_reason = 'teste encerrado', updated_at = now() where conversation_id = ${old.id} and status = 'scheduled'`;
+        await sql`update public.team_questions set status = 'canceled', due_at = null, outcome = 'teste encerrado', updated_at = now() where conversation_id = ${old.id} and status = 'open'`;
+      }
+    }
     const [conv] = await sql<{ id: string; activated_at: Date | null }[]>`
-      insert into public.conversations (agent_id, company_id, external_id, simulation, contact_name, phone)
-      values (${a.id}, ${a.company_id}, ${body.session}, true, ${body.contact_name ?? "Lead de teste"}, '5500000000000')
-      on conflict (agent_id, simulation, external_id) do update set contact_name = coalesce(${body.contact_name ?? null}, public.conversations.contact_name)
+      insert into public.conversations (agent_id, company_id, external_id, simulation, contact_name, phone, tester, test_origin)
+      values (${a.id}, ${a.company_id}, ${body.session}, true, ${body.contact_name ?? "Lead de teste"}, '5500000000000', ${body.tester ?? null}, ${body.origin})
+      on conflict (agent_id, simulation, external_id) do update set contact_name = coalesce(${body.contact_name ?? null}, public.conversations.contact_name),
+        tester = coalesce(public.conversations.tester, excluded.tester), test_origin = coalesce(public.conversations.test_origin, excluded.test_origin)
       returning id, activated_at`;
     if (body.reset) {
       await sql`delete from public.messages where conversation_id = ${conv!.id}`;
@@ -83,6 +100,8 @@ export async function simulateRoutes(app: FastifyInstance) {
       conv!.activated_at = new Date();
     }
     if (body.facts) await sql`update public.conversations set facts = facts || ${sql.json(body.facts)} where id = ${conv!.id}`;
+    // O lead respondeu: a régua de follow-up para (como na entrada das conversas reais).
+    await sql`update public.conversations set followup_step = 0, followup_next_at = null, followup_state = 'idle', last_inbound_at = now() where id = ${conv!.id}`;
     const contentType = MEDIA_TYPES.has(body.content_type) && body.media_url ? body.content_type : "text";
     const [m] = await sql<{ id: string }[]>`
       insert into public.messages (conversation_id, role, content, content_type, media)
@@ -114,6 +133,47 @@ export async function simulateRoutes(app: FastifyInstance) {
       where c.agent_id = ${a.id} and c.simulation and c.external_id = ${session}
       order by m.id limit 500`;
     return { messages };
+  });
+
+  // ---------------------------------------------------------------- avançar o tempo (Testar)
+  const SimUse = z.object({ use: z.union([z.literal("draft"), z.literal("published"), z.number().int().min(1)]).default("draft"), ...ModelDefaults });
+  /** A especificação do teste (rascunho ou versão) e a conversa de teste pela sessão. */
+  async function simContext(a: Awaited<ReturnType<typeof loadAgent>>, session: string, body: z.infer<typeof SimUse>) {
+    let spec: AgentSpec;
+    let version: number | null = null;
+    if (body.use === "draft") {
+      const r = parseSpec(a.draft);
+      if (!r.ok) throw new HttpError(422, "O rascunho tem campos inválidos.", r.errors);
+      spec = withModelDefaults(r.spec, body);
+    } else {
+      version = body.use === "published" ? a.published_version : body.use;
+      if (!version) throw new HttpError(400, "O agente ainda não tem versão publicada.");
+      const [v] = await db()<{ spec: unknown }[]>`select spec from public.agent_versions where agent_id = ${a.id} and version = ${version}`;
+      const r = parseSpec(v?.spec);
+      if (!r.ok) throw notFound("Versão");
+      spec = r.spec;
+    }
+    const [conv] = await db()<(ConversationRow & Record<string, unknown>)[]>`
+      select * from public.conversations where agent_id = ${a.id} and simulation and external_id = ${session}`;
+    return { spec, version, conv: conv ?? null };
+  }
+
+  /** O que está agendado na conversa de teste (follow-up, retorno, sem resposta da equipe). */
+  app.post("/v1/agents/:id/simulations/:session/schedule", async (req) => {
+    const { id, session } = req.params as { id: string; session: string };
+    const a = await loadAgent(req, id);
+    const { spec, conv } = await simContext(a, session, parseBody(SimUse, req.body ?? {}));
+    return { items: conv ? await simSchedule(conv as never, spec) : [] };
+  });
+
+  /** Faz o próximo item agendado acontecer agora, com as regras do real (nada sai para o WhatsApp). */
+  app.post("/v1/agents/:id/simulations/:session/advance", async (req) => {
+    const { id, session } = req.params as { id: string; session: string };
+    const a = await loadAgent(req, id);
+    const { spec, version, conv } = await simContext(a, session, parseBody(SimUse, req.body ?? {}));
+    if (!conv) throw notFound("Conversa de teste");
+    const r = await advanceSim(conv, spec, version);
+    return { ...r, items: await simSchedule((await db()`select * from public.conversations where id = ${conv.id}`)[0] as never, spec) };
   });
 
   // ---------------------------------------------------------------- rastros e uso
@@ -188,8 +248,10 @@ export async function simulateRoutes(app: FastifyInstance) {
    */
   app.get("/v1/agents/:id/leads", async (req) => {
     const a = await loadAgent(req, (req.params as { id: string }).id);
-    const q = req.query as { limit?: string; q?: string; before?: string; errors?: string };
+    const q = req.query as { limit?: string; q?: string; before?: string; errors?: string; tests?: string };
     const limit = Math.min(Math.max(Number(q.limit) || 50, 1), 100);
+    // Testes: as conversas da aba Testar (uma por teste), com quem testou; a busca vale também para quem testou.
+    const tests = q.tests === "true";
     const term = String(q.q ?? "").trim().slice(0, 80);
     const digits = term.replace(/\D/g, "");
     const like = term ? `%${term.replace(/[%_\\]/g, (c) => `\\${c}`)}%` : null;
@@ -197,12 +259,14 @@ export async function simulateRoutes(app: FastifyInstance) {
     const onlyErrors = q.errors === "true";
     const sql = db();
     const conv = sql`
-      select c.id, c.phone, c.contact_name, c.created_at,
-             coalesce(nullif(regexp_replace(coalesce(c.phone, ''), '\\D', '', 'g'), ''), 'c:' || c.id::text) as lead_key,
+      select c.id, c.phone, c.contact_name, c.created_at, c.tester, c.ended_at,
+             case when ${tests} then 'c:' || c.id::text
+                  else coalesce(nullif(regexp_replace(coalesce(c.phone, ''), '\\D', '', 'g'), ''), 'c:' || c.id::text) end as lead_key,
              greatest(coalesce(c.last_inbound_at, c.created_at), coalesce(c.last_reply_at, c.created_at)) as last_at
       from public.conversations c
-      where c.agent_id = ${a.id} and not c.simulation
-        and (${like}::text is null or c.contact_name ilike ${like} or (${digits} <> '' and regexp_replace(coalesce(c.phone, ''), '\\D', '', 'g') like ${`%${digits}%`}))
+      where c.agent_id = ${a.id} and c.simulation = ${tests} and (not ${tests} or c.test_origin = 'testar')
+        and (${like}::text is null or c.contact_name ilike ${like} or (${tests} and c.tester ilike ${like})
+             or (not ${tests} and ${digits} <> '' and regexp_replace(coalesce(c.phone, ''), '\\D', '', 'g') like ${`%${digits}%`}))
         and (not ${onlyErrors} or exists (select 1 from public.turns t where t.conversation_id = c.id and t.status = 'error'))`;
     const rows = await sql`
       with conv as (${conv}),
@@ -211,12 +275,14 @@ export async function simulateRoutes(app: FastifyInstance) {
                array_agg(id order by last_at desc) as ids,
                jsonb_agg(jsonb_build_object('id', id, 'created_at', created_at, 'last_at', last_at) order by last_at desc) as conversations,
                (array_agg(contact_name order by last_at desc) filter (where contact_name is not null))[1] as contact_name,
-               (array_agg(phone order by last_at desc) filter (where phone is not null))[1] as phone
+               (array_agg(phone order by last_at desc) filter (where phone is not null))[1] as phone,
+               (array_agg(tester order by last_at desc) filter (where tester is not null))[1] as tester,
+               max(ended_at) as ended_at
         from conv group by lead_key
         having ${before}::timestamptz is null or max(last_at) < ${before}::timestamptz
         order by max(last_at) desc limit ${limit + 1}
       )
-      select g.lead_key, g.last_at, g.first_at, g.conversations, g.contact_name, g.phone,
+      select g.lead_key, g.last_at, g.first_at, g.conversations, g.contact_name, g.phone, g.tester, g.ended_at, coalesce(t.versions, '{}') as versions,
              lm.role as last_role, lm.content as last_content, coalesce(st.messages, 0) as messages,
              coalesce(t.replies, 0) as replies, coalesce(t.errors, 0) as errors, coalesce(t.cost_usd, 0) as cost_usd,
              (select min(k.due_at) from public.agent_callbacks k where k.conversation_id = any (g.ids) and k.status = 'scheduled') as callback_at
@@ -228,7 +294,9 @@ export async function simulateRoutes(app: FastifyInstance) {
         select count(*)::int as messages from public.messages m where m.conversation_id = any (g.ids) and m.role in ('user', 'assistant')) st on true
       left join lateral (
         select count(*) filter (where t.status = 'done')::int as replies, count(*) filter (where t.status = 'error')::int as errors,
-               sum(t.cost_usd) as cost_usd
+               sum(t.cost_usd) as cost_usd,
+               -- As versões testadas ("rascunho" ou o número publicado).
+               array_agg(distinct coalesce(t.agent_version::text, 'rascunho')) filter (where ${tests}) as versions
         from public.turns t where t.conversation_id = any (g.ids)) t on true
       order by g.last_at desc`;
     const page = rows.slice(0, limit);

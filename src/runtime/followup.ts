@@ -9,6 +9,7 @@ import { conversationAiOn, inboxType, listTemplates, rest, sendTemplate, wabaWin
 import { deliverMessage } from "./deliver.js";
 import { agentKeys } from "../secrets.js";
 import { categoryOf, countryOf, recordCost, wabaPrice } from "../costs/ledger.js";
+import type { AgentSpec } from "../spec/agent.js";
 import type { FollowupStepT, FollowupT } from "../spec/followup.js";
 import type { TeamNotifyConfig } from "../spec/integrations.js";
 import type { WeeklyHours } from "../spec/weekly-hours.js";
@@ -146,45 +147,10 @@ export async function processFollowup(conversationId: string, step: number): Pro
     } else if (s.mode === "fixed") {
       texts = [cleanText(fill(s.text, vars), spec)];
     } else {
-      const history = (
-        await sql<{ role: "user" | "assistant"; content: string }[]>`
-          select role, content from (select id, role, content from public.messages
-            where conversation_id = ${conv.id} and role in ('user', 'assistant') order by id desc limit 30) h order by id`
-      ).map((m) => ({ role: m.role, content: m.content }) as ChatMessage);
-      const res = await chatWithFallback(
-        {
-          model: spec.model.model ?? config().DEFAULT_MODEL,
-          keys: await agentKeys(conv.agent_id),
-          pricing: spec.model.pricing,
-          maxTokens: 600,
-          messages: [
-            { role: "system", content: buildSystemPrompt(spec) },
-            ...history,
-            {
-              role: "user",
-              content:
-                `[Instrução do sistema — o lead não respondeu à sua última mensagem. Esta é a retomada ${step + 1} de ${steps.length}.]\n` +
-                "Escreva UMA retomada curta e natural (1 ou 2 mensagens curtas, separadas por uma linha em branco), sem repetir o que já disse e sem saudação longa. " +
-                "Puxe o assunto de onde parou e convide o lead a responder. Responda só com o texto das mensagens.\n" +
-                `Se não fizer sentido retomar agora (o lead pediu para parar, já comprou, já tem visita marcada ou a orientação manda não enviar), responda só ${SKIP_WORD}.\n` +
-                (s.text ? `Orientação: ${s.text}\n` : "") +
-                contextBlock({ contactName: conv.contact_name, phone: conv.phone, facts: conv.facts, summary: conv.summary, retrieved: [] }),
-            },
-          ],
-        },
-        spec.model.fallback_model ?? config().FALLBACK_MODEL,
-        spec.model.fallback_pricing,
-      );
-      usage = res.usage;
-      model = res.model;
-      await recordCost({ agentId: conv.agent_id, conversationId: conv.id, turnId, source: "followup", usage: res.usage, model: res.model, meta: { step } });
-      // A IA decidiu não retomar agora: a etapa conta como pulada (a régua segue).
-      const raw = (res.message.content ?? "").trim();
-      texts = (raw.replace(/[.!\s]/g, "").toUpperCase() === SKIP_WORD ? "" : raw)
-        .split(/\n\s*\n/)
-        .map((t) => cleanText(t, spec))
-        .filter(Boolean)
-        .slice(0, 2);
+      const r = await writeFollowupAi(spec, conv, step, steps.length, s, turnId);
+      texts = r.texts;
+      usage = r.usage;
+      model = r.model;
     }
 
     if (!closed) {
@@ -240,4 +206,54 @@ export async function processFollowup(conversationId: string, step: number): Pro
     log.warn({ conversationId: conv.id, err: e instanceof Error ? e.message : String(e) }, "follow-up: ação do fim falhou");
   }
   return "finished";
+}
+
+/** A retomada escrita pela IA (a mesma no real e no "Avançar o tempo" do Testar). Vazia: a IA decidiu não retomar agora. */
+export async function writeFollowupAi(
+  spec: AgentSpec,
+  conv: ConversationRow,
+  step: number,
+  total: number,
+  s: FollowupStepT,
+  turnId: string,
+): Promise<{ texts: string[]; usage: { tokensIn: number; tokensOut: number; tokensCached: number; costUsd: number }; model: string }> {
+  const sql = db();
+  const history = (
+    await sql<{ role: "user" | "assistant"; content: string }[]>`
+      select role, content from (select id, role, content from public.messages
+        where conversation_id = ${conv.id} and role in ('user', 'assistant') order by id desc limit 30) h order by id`
+  ).map((m) => ({ role: m.role, content: m.content }) as ChatMessage);
+  const res = await chatWithFallback(
+    {
+      model: spec.model.model ?? config().DEFAULT_MODEL,
+      keys: await agentKeys(conv.agent_id),
+      pricing: spec.model.pricing,
+      maxTokens: 600,
+      messages: [
+        { role: "system", content: buildSystemPrompt(spec) },
+        ...history,
+        {
+          role: "user",
+          content:
+            `[Instrução do sistema — o lead não respondeu à sua última mensagem. Esta é a retomada ${step + 1} de ${total}.]\n` +
+            "Escreva UMA retomada curta e natural (1 ou 2 mensagens curtas, separadas por uma linha em branco), sem repetir o que já disse e sem saudação longa. " +
+            "Puxe o assunto de onde parou e convide o lead a responder. Responda só com o texto das mensagens.\n" +
+            `Se não fizer sentido retomar agora (o lead pediu para parar, já comprou, já tem visita marcada ou a orientação manda não enviar), responda só ${SKIP_WORD}.\n` +
+            (s.text ? `Orientação: ${s.text}\n` : "") +
+            contextBlock({ contactName: conv.contact_name, phone: conv.phone, facts: conv.facts, summary: conv.summary, retrieved: [] }),
+        },
+      ],
+    },
+    spec.model.fallback_model ?? config().FALLBACK_MODEL,
+    spec.model.fallback_pricing,
+  );
+  await recordCost({ agentId: conv.agent_id, conversationId: conv.id, turnId, simulation: conv.simulation, source: "followup", usage: res.usage, model: res.model, meta: { step } });
+  // A IA decidiu não retomar agora: a etapa conta como pulada (a régua segue).
+  const raw = (res.message.content ?? "").trim();
+  const texts = (raw.replace(/[.!\s]/g, "").toUpperCase() === SKIP_WORD ? "" : raw)
+    .split(/\n\s*\n/)
+    .map((t) => cleanText(t, spec))
+    .filter(Boolean)
+    .slice(0, 2);
+  return { texts, usage: res.usage, model: res.model };
 }

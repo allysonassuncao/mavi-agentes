@@ -13,7 +13,8 @@ import type { ActionDebug } from "./debug.js";
  * APIs externas: cada API configurada vira a ferramenta api_<id>. O motor monta
  * a chamada (caminho, URL, cabeçalhos, corpo e a chave do cofre), chama só
  * endereços públicos e devolve ao agente a parte da resposta que interessa.
- * Na aba Testar, as consultas vão de verdade; as que enviam dados, não.
+ * Na aba Testar, as consultas vão de verdade; as que enviam dados, só se a
+ * API estiver marcada para enviar no teste (test_send).
  *
  * Com OAuth, o motor pede o token com as credenciais do cofre e guarda até
  * vencer. Resposta em lista: os filtros (campos "filtrar a resposta") escolhem
@@ -528,7 +529,7 @@ export async function runApiTool(name: string, args: Record<string, unknown>, ct
   let secret: string | null = null;
   try {
     secret = api.auth.type === "none" ? null : await apiSecret(ctx.agentId, api.id);
-    if (api.kind === "write" && ctx.simulation) {
+    if (api.kind === "write" && ctx.simulation && !api.test_send) {
       const req = buildRequest(api, values, api.auth.type === "oauth2" ? "token-de-teste" : secret);
       return {
         result: `(Teste: nada foi enviado de verdade.) No ar, enviaria para "${api.name}": ${JSON.stringify(req.preview.body ?? req.preview.url).slice(0, 1500)}. Continue a conversa como se o envio tivesse dado certo.`,
@@ -541,8 +542,8 @@ export async function runApiTool(name: string, args: Record<string, unknown>, ct
       result: `Resposta de "${api.name}" (HTTP ${out.response.status}):\n${out.result}${extra}\nUse só o que está aqui; o que não veio, não invente.`,
       media: out.media,
       debug: {
-        outcome: ctx.simulation ? "simulated" : "ok",
-        summary: `${out.request.method} ${out.request.url} → ${out.response.status} em ${out.response.ms} ms`,
+        outcome: ctx.simulation && api.kind === "read" ? "simulated" : "ok",
+        summary: `${ctx.simulation && api.kind === "write" ? "Teste com envio de verdade: " : ""}${out.request.method} ${out.request.url} → ${out.response.status} em ${out.response.ms} ms`,
         details: [`Resposta usada: ${out.result.slice(0, 1200)}`, ...(out.media.length ? [`Mídias: ${out.media.map((m) => m.url).join(" ")}`.slice(0, 1200)] : [])],
       },
     };

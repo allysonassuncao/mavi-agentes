@@ -19,6 +19,15 @@ vi.mock("../src/config.js", () => ({
     MAKECRM_MEET_DELETE_URL: "https://hooks.test/bb914715",
   }),
 }));
+// Redis de mentira (as travas de repetição valem também na simulação).
+const keys = new Map<string, string>();
+vi.mock("../src/redis.js", () => ({
+  redis: () => ({
+    set: async (k: string, v: string, ..._opts: unknown[]) => (keys.has(k) ? null : (keys.set(k, v), "OK")),
+    ttl: async () => -1,
+    del: async (k: string) => (keys.delete(k) ? 1 : 0),
+  }),
+}));
 const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response("ok"));
 vi.stubGlobal("fetch", fetchMock);
 
@@ -83,6 +92,7 @@ const ctxOf = (s: ReturnType<typeof spec>, simulation = false) => ({
 });
 
 beforeEach(() => {
+  keys.clear();
   calls.length = 0;
   fetchMock.mockClear();
   tables = { currencys: [{ id: 1, code: "BRL", symbol: "R$" }] };
@@ -189,6 +199,10 @@ describe("ações na oportunidade: igual à tela do MakeCRM", () => {
     expect(low.result).toContain("mínimo para este produto é 900.00");
     const ok = await runIntegrationTool("registrar_orcamento", { produto: "P1", valor: "R$ 950,00" }, ctxOf(s, true));
     expect(ok.result).toContain("por 950.00");
+    // Na simulação a trava de repetição vale igual ao real: o mesmo produto de novo não repete.
+    const again = await runIntegrationTool("registrar_orcamento", { produto: "P1" }, ctxOf(s, true));
+    expect(again.result).toContain("já foi feito nesta conversa");
+    keys.clear();
     const list = await runIntegrationTool("registrar_orcamento", { produto: "P1" }, ctxOf(s, true));
     expect(list.result).toContain("por 1000.00");
   });

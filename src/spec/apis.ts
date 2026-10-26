@@ -142,6 +142,8 @@ export const ExternalApi = z
       .default(RESPONSE_DEFAULT),
     /** Roda sozinha no começo da conversa e o resultado vira contexto (só com dados fixos ou do contato). */
     on_start: z.boolean().default(false),
+    /** write: no Testar, envia de verdade (o sistema do cliente tem ambiente de teste); desligado, só mostra o que enviaria. */
+    test_send: z.boolean().default(false),
     timeout_seconds: z.number().int().min(3).max(30).default(15),
   })
   .strict()

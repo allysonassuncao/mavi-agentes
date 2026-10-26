@@ -601,16 +601,17 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
     }
 
     // A régua de follow-up começa a contar a partir desta resposta (sem resposta ou passando para a equipe: não).
+    // No teste também (não sai sozinha: o "Avançar o tempo" do Testar faz a próxima etapa acontecer).
     const fu = spec.followup;
     const stopFollowup = !!scenario && (scenario.scenario.actions.stop_followup || scenario.scenario.actions.turn_off_ai);
     // Retorno combinado marcado: a régua espera por ele (se configurado assim).
-    const waitCallback = live && callbacksOn(spec) && spec.callbacks.followup.during === "pause" && !!(await pendingCallback(conv.id));
-    if (live && waitCallback) {
+    const waitCallback = callbacksOn(spec) && spec.callbacks.followup.during === "pause" && !!(await pendingCallback(conv.id));
+    if (waitCallback) {
       await sql`update public.conversations set followup_next_at = null, followup_state = 'idle' where id = ${conv.id}`;
-    } else if (live && status === "done" && !handoff && !stopFollowup && fu?.enabled && fu.steps.length) {
+    } else if (status === "done" && !handoff && !stopFollowup && fu?.enabled && fu.steps.length) {
       // Na trilha da etapa do funil do lead (fora das etapas escolhidas, fica parada).
       await startFollowup(fu, conv).catch((e) => log.warn({ err: String(e) }, "turn: follow-up não começou"));
-    } else if (live && (handoff || stopFollowup)) {
+    } else if (handoff || stopFollowup) {
       await sql`update public.conversations set followup_next_at = null, followup_state = 'idle' where id = ${conv.id}`;
     }
 
