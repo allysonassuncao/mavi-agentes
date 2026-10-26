@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parsePersonas, parseVerdict, summarize } from "../src/tests/runner.js";
+import { parseCompare, parsePersonas, parseVerdict, summarize } from "../src/tests/runner.js";
 
 describe("testes com leads simulados", () => {
   it("perfis: valida, corta e completa", () => {
@@ -57,5 +57,30 @@ describe("testes com leads simulados", () => {
     ]);
     expect(s).toMatchObject({ conversations: 3, evaluated: 2, errors: 1, score: 6.5, goal_rate: 0.5, severe: 1, outcomes: { scheduled: 1, ghosted: 1 } });
     expect(s.issues.wrong_info!.n).toBe(1);
+  });
+});
+
+describe("reencenar conversas reais", () => {
+  const turns = [
+    { lead: "oi, tem o onix 2020?", original: "Tenho sim! Quer ver fotos?", agent: "Tenho o Onix 2020 por R$ 62.900. Quer as fotos?" },
+    { lead: "quanto fica a parcela", original: "Fica R$ 1.200", agent: "Depende da entrada" },
+  ];
+  it("lê o avaliador vez a vez e conta melhor, igual e pior", () => {
+    const c = parseCompare([{ vez: 1, resultado: "melhor", motivo: "deu o preço" }, { vez: 2, resultado: "pior", motivo: "não simulou" }, { vez: 9, resultado: "pior" }], turns);
+    expect(c).toMatchObject({ better: 1, same: 0, worse: 1 });
+    expect(c.turns.map((t) => [t.t, t.result, t.why])).toEqual([
+      [1, "melhor", "deu o preço"],
+      [2, "pior", "não simulou"],
+    ]);
+    expect(parseCompare([{ vez: 1, resultado: "talvez" }], turns.slice(0, 1)).turns[0]!.result).toBe("igual");
+  });
+  it("o resumo da bateria soma a comparação", () => {
+    const v = { score: 7, goal_reached: true, outcome: "scheduled", issues: [], gaps: [], strengths: [], summary: "" };
+    const s = summarize([
+      { status: "done", verdict: { ...v, compare: parseCompare([{ vez: 1, resultado: "melhor" }], turns.slice(0, 1)) } },
+      { status: "done", verdict: { ...v, compare: parseCompare([{ vez: 1, resultado: "igual" }, { vez: 2, resultado: "pior" }], turns) } },
+    ]);
+    expect(s.replay).toEqual({ better: 1, same: 1, worse: 1 });
+    expect(summarize([{ status: "done", verdict: v }]).replay).toBeUndefined();
   });
 });

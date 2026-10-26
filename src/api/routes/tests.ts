@@ -16,8 +16,20 @@ import { loadAgent, ModelDefaults, withModelDefaults } from "./agents.js";
 
 const TZ = "America/Sao_Paulo";
 
+/** Reencenar: uma conversa real (as mensagens do lead em cada vez e o que o agente de antes respondeu). */
+const Script = z.object({
+  nome: z.string().trim().min(1).max(80),
+  fonte: z.string().max(200).default(""),
+  turns: z
+    .array(z.object({ lead: z.array(z.string().max(4000)).min(1).max(20), original: z.array(z.string().max(4000)).max(20).default([]) }))
+    .min(1)
+    .max(20),
+});
+
 const Start = z.object({
-  kind: z.enum(["manual", "publish", "scheduled"]).default("manual"),
+  kind: z.enum(["manual", "publish", "scheduled", "replay"]).default("manual"),
+  /** kind "replay": as conversas reais, uma por conversa da bateria. */
+  scripts: z.array(Script).max(30).default([]),
   use: z.union([z.literal("draft"), z.literal("published"), z.number().int().min(1)]).default("draft"),
   conversations: z.number().int().min(1).max(50),
   max_turns: z.number().int().min(2).max(20).default(8),
@@ -50,12 +62,30 @@ export async function testRoutes(app: FastifyInstance) {
       if (!r.ok) throw notFound("Versão");
       return { spec: r.spec, version };
     };
+    if (body.kind === "replay" && !body.scripts.length) throw new HttpError(400, "Mande as conversas para reencenar.");
+    const personas =
+      body.kind === "replay"
+        ? body.scripts.map((x) => ({
+            nome: x.nome,
+            perfil: "replay",
+            descricao: "Conversa real reencenada",
+            objetivo: "",
+            conhece: "",
+            objecoes: [],
+            estilo: "",
+            fim_quando: "",
+            fonte: x.fonte,
+            script: x.turns,
+          }))
+        : [];
     const insert = async (use: "draft" | "published" | number, compareTo: string | null) => {
       const s = await specOf(use);
+      const conversations = personas.length || body.conversations;
+      const maxTurns = personas.length ? Math.min(20, Math.max(2, ...personas.map((x) => x.script.length))) : body.max_turns;
       const [row] = await sql<{ id: string }[]>`
-        insert into public.test_runs (agent_id, kind, agent_version, spec, compare_to, profiles, focus, conversations, max_turns, cost_cap_usd, created_by)
-        values (${a.id}, ${body.kind}, ${s.version}, ${sql.json(s.spec as never)}, ${compareTo}, ${profiles}, ${body.focus}, ${body.conversations},
-                ${body.max_turns}, ${body.cost_cap_usd}, ${body.created_by ?? req.client!.name})
+        insert into public.test_runs (agent_id, kind, agent_version, spec, compare_to, profiles, focus, personas, conversations, max_turns, cost_cap_usd, created_by)
+        values (${a.id}, ${body.kind}, ${s.version}, ${sql.json(s.spec as never)}, ${compareTo}, ${profiles}, ${body.focus}, ${sql.json(personas as never)},
+                ${conversations}, ${maxTurns}, ${body.cost_cap_usd}, ${body.created_by ?? req.client!.name})
         returning id`;
       return row!.id;
     };
@@ -119,7 +149,7 @@ export async function testRoutes(app: FastifyInstance) {
 
   /** Baterias terminadas desde um momento (o aviso das periódicas, no MAVI Tasks). */
   app.post("/v1/test-runs/finished", async (req) => {
-    const body = parseBody(z.object({ since: z.string().datetime(), kind: z.enum(["manual", "publish", "scheduled"]).optional() }), req.body);
+    const body = parseBody(z.object({ since: z.string().datetime(), kind: z.enum(["manual", "publish", "scheduled", "replay"]).optional() }), req.body);
     const runs = await db()`
       select r.id, r.agent_id, r.kind, r.status, r.summary, r.cost_usd::float8 as cost_usd, r.finished_at, a.name as agent_name, a.external_ref
       from public.test_runs r join public.agents a on a.id = r.agent_id

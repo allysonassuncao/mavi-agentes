@@ -43,7 +43,20 @@ export type Persona = {
   objecoes: string[];
   estilo: string;
   fim_quando: string;
+  /** Reencenar (kind "replay"): as mensagens reais do lead em cada vez e o que o agente de antes respondeu. */
+  script?: ReplayTurn[];
+  /** De onde veio a conversa reencenada (ex.: "Caixa Luiza · 12/10"). */
+  fonte?: string;
 };
+export type ReplayTurn = { lead: string[]; original: string[] };
+/** O avaliador da reencenação, vez a vez: a resposta do agente de antes contra a de agora. */
+export type ReplayCompare = {
+  turns: { t: number; result: "igual" | "melhor" | "pior"; why: string; lead: string; original: string; agent: string }[];
+  better: number;
+  same: number;
+  worse: number;
+};
+const profileLabel = (p: Persona) => (p.script ? "Conversa real" : (PROFILES[p.perfil]?.label ?? p.perfil));
 
 export const TEST_ISSUES = ["wrong_info", "ignored_question", "repetition", "overpromise", "tone", "missed_handoff", "rule_violation", "off_script", "other"] as const;
 
@@ -333,6 +346,41 @@ export async function runConversation(runId: string, idx: number): Promise<strin
     const conversationId = conv!.id;
     await sql`update public.test_conversations set conversation_id = ${conversationId} where id = ${tc.id}`;
 
+    // Reencenar: as mensagens reais do lead, na ordem, ao lado do que o agente de antes respondeu.
+    if (p.script?.length) {
+      const turnsDone: { lead: string; original: string; agent: string }[] = [];
+      let gapsReplay: GapDraft[] = [];
+      for (const st of p.script.slice(0, run.max_turns)) {
+        const texts = st.lead.map((x) => x.trim()).filter(Boolean);
+        if (!texts.length) continue;
+        for (const text of texts) await sql`insert into public.messages (conversation_id, role, content) values (${conversationId}, 'user', ${text})`;
+        const r = await runTurn({ conversationId, spec, agentVersion: run.agent_version });
+        if (r.status === "error") throw new Error(`O agente falhou: ${r.error ?? "erro"}`);
+        turnsDone.push({ lead: texts.join("\n"), original: st.original.join("\n"), agent: r.messages.map((m) => m.text).join("\n") });
+        if (r.turnId) {
+          const [tr] = await sql<{ output: { gaps?: unknown } | null }[]>`select output from public.turns where id = ${r.turnId}`;
+          gapsReplay = gapsReplay.concat(parseGaps(tr?.output?.gaps));
+        }
+        if ((await runCost(runId)) >= cap) {
+          await stopRun(runId, "teto de custo da bateria");
+          break;
+        }
+        const [fresh] = await sql<{ status: string }[]>`select status from public.test_runs where id = ${runId}`;
+        if (fresh?.status !== "running") break;
+      }
+      const verdict = turnsDone.length ? await judgeReplay(run, spec, turnsDone, conversationId) : null;
+      const all = [...gapsReplay, ...(verdict?.gaps ?? [])].filter((g, i, a) => a.findIndex((x) => x.text.toLowerCase() === g.text.toLowerCase()) === i);
+      if (all.length)
+        await recordGaps({ agentId: run.agent_id, conversationId, turnId: null, leadText: turnsDone.map((x) => x.lead).join("\n").slice(0, 1000), gaps: all, origin: "test" });
+      const [cost] = await sql<{ c: number }[]>`select coalesce(sum(cost_usd), 0)::float8 as c from public.cost_events where conversation_id = ${conversationId}`;
+      await sql`
+        update public.test_conversations set status = ${verdict ? "done" : "skipped"}, turns = ${turnsDone.length},
+          verdict = ${verdict ? sql.json({ ...verdict, gaps: all } as never) : null}, cost_usd = ${cost?.c ?? 0}, finished_at = now()
+        where id = ${tc.id}`;
+      await finishIfDone(runId);
+      return "feita";
+    }
+
     // Visto do lado do lead: o que o agente diz é "user", o que o lead diz é "assistant".
     const leadHistory: { role: "user" | "assistant"; content: string }[] = [];
     const lines: string[] = [];
@@ -386,12 +434,71 @@ export async function runConversation(runId: string, idx: number): Promise<strin
   return "feita";
 }
 
+export function parseCompare(raw: unknown, turns: { lead: string; original: string; agent: string }[]): ReplayCompare {
+  const list = Array.isArray(raw) ? raw : [];
+  const out: ReplayCompare["turns"] = turns.map((x, i) => {
+    const o = (list.find((y) => Number((y as Record<string, unknown>)?.vez) === i + 1) ?? {}) as Record<string, unknown>;
+    const result = ["igual", "melhor", "pior"].includes(String(o.resultado)) ? (String(o.resultado) as "igual" | "melhor" | "pior") : "igual";
+    return { t: i + 1, result, why: clip(o.motivo, 400), lead: clip(x.lead, 1000), original: clip(x.original, 2000), agent: clip(x.agent, 2000) };
+  });
+  return {
+    turns: out,
+    better: out.filter((x) => x.result === "melhor").length,
+    same: out.filter((x) => x.result === "igual").length,
+    worse: out.filter((x) => x.result === "pior").length,
+  };
+}
+
+async function judgeReplay(run: RunRow, spec: AgentSpec, turns: { lead: string; original: string; agent: string }[], conversationId: string) {
+  const leadText = turns.map((x) => x.lead).join("\n");
+  const kb = await searchKnowledge({ agentId: run.agent_id, query: leadText.slice(0, 2000), k: 6 }).catch(() => ({ results: [] }));
+  const ins = spec.instructions;
+  const r = await chat({
+    model: config().DEFAULT_MODEL,
+    keys: await agentKeys(run.agent_id),
+    json: true,
+    effort: "low",
+    maxTokens: 5000,
+    timeoutMs: 150_000,
+    messages: [
+      {
+        role: "system",
+        content: [
+          "Uma conversa real de atendimento no WhatsApp foi reencenada: as mensagens do lead são as reais, na ordem; em cada vez você vê a resposta ORIGINAL (o agente de antes, que atendeu de verdade) e a NOVA (o agente de agora).",
+          "Compare vez a vez: \"igual\" (mesmo conteúdo e efeito, mesmo com outras palavras), \"melhor\" (a nova acerta o que a original errou, ou avança mais) ou \"pior\" (a nova erra, inventa, esquece algo que a original fez, quebra uma regra). Lembre que o lead real reagiu à resposta original, não à nova.",
+          "Depois avalie a conversa nova como um todo. Em português, exigente e justo.",
+          'Responda só JSON: {"vezes": [{"vez": 1, "resultado": "igual|melhor|pior", "motivo": "curto"}], "nota": 0-10, "objetivo_atingido": true|false, "resultado": "scheduled|purchased|qualified|handed_off|in_progress|not_interested|ghosted|disqualified|other",',
+          ' "problemas": [{"tipo": "wrong_info|ignored_question|repetition|overpromise|tone|missed_handoff|rule_violation|off_script|other", "gravidade": 1-3, "detalhe": "...", "trecho": "o que o agente novo disse"}],',
+          ' "lacunas": [{"tipo": "pergunta|objecao", "texto": "..."}], "pontos_fortes": ["..."], "resumo": "uma frase comparando os dois"}',
+        ].join("\n"),
+      },
+      {
+        role: "user",
+        content: [
+          agentBrief(spec),
+          ins.rules.length ? `Regras do agente:\n- ${ins.rules.join("\n- ")}` : "",
+          kb.results.length ? `Material do agente (trechos):\n${kb.results.map((x) => `- ${x.title ? `${x.title}: ` : ""}${x.content.slice(0, 600)}`).join("\n")}` : "",
+          turns
+            .map((x, i) => `### Vez ${i + 1}\nLead: ${x.lead}\nORIGINAL: ${x.original || "(não respondeu)"}\nNOVA: ${x.agent || "(não respondeu)"}`)
+            .join("\n\n")
+            .slice(-24_000),
+        ]
+          .filter(Boolean)
+          .join("\n\n"),
+      },
+    ],
+  });
+  await recordCost({ agentId: run.agent_id, conversationId, source: "test_judge", simulation: true, usage: r.usage, model: r.model, meta: { test_run: run.id, replay: true } });
+  const raw = json(r.message.content);
+  return { ...parseVerdict(raw), compare: parseCompare(raw.vezes, turns) };
+}
+
 export async function stopRun(runId: string, reason: string) {
   await db()`update public.test_runs set status = 'stopped', stop_reason = ${reason} where id = ${runId} and status in ('queued', 'running')`;
 }
 
 /** As contas da bateria quando a última conversa termina (uma vez só). */
-export function summarize(convs: { status: string; verdict: Verdict | null }[]) {
+export function summarize(convs: { status: string; verdict: (Verdict & { compare?: ReplayCompare }) | null }[]) {
   const done = convs.filter((c) => c.verdict);
   const issues: Record<string, { n: number; examples: string[] }> = {};
   const outcomes: Record<string, number> = {};
@@ -414,6 +521,15 @@ export function summarize(convs: { status: string; verdict: Verdict | null }[]) 
     issues,
     gaps: done.reduce((s, c) => s + c.verdict!.gaps.length, 0),
     severe: done.reduce((s, c) => s + c.verdict!.issues.filter((i) => i.severity >= 3).length, 0),
+    ...(done.some((c) => c.verdict!.compare)
+      ? {
+          replay: {
+            better: done.reduce((s, c) => s + (c.verdict!.compare?.better ?? 0), 0),
+            same: done.reduce((s, c) => s + (c.verdict!.compare?.same ?? 0), 0),
+            worse: done.reduce((s, c) => s + (c.verdict!.compare?.worse ?? 0), 0),
+          },
+        }
+      : {}),
   };
 }
 
@@ -453,7 +569,7 @@ export async function finishIfDone(runId: string) {
             content: done
               .map(
                 (c, i) =>
-                  `Conversa ${i + 1} (${PROFILES[c.persona.perfil]?.label ?? c.persona.perfil}): nota ${c.verdict!.score}, objetivo ${c.verdict!.goal_reached ? "atingido" : "não atingido"}. ${c.verdict!.summary}\n` +
+                  `Conversa ${i + 1} (${profileLabel(c.persona)}): nota ${c.verdict!.score}, objetivo ${c.verdict!.goal_reached ? "atingido" : "não atingido"}. ${c.verdict!.summary}\n` +
                   c.verdict!.issues.map((x) => `- ${x.type} (gravidade ${x.severity}): ${x.detail}`).join("\n") +
                   (c.verdict!.gaps.length ? `\nLacunas: ${c.verdict!.gaps.map((g) => g.text).join("; ")}` : ""),
               )
