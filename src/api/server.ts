@@ -16,6 +16,7 @@ import { secretRoutes } from "./routes/secrets.js";
 import { simulateRoutes } from "./routes/simulate.js";
 import { callbackRoutes } from "./routes/callbacks.js";
 import { apiRoutes } from "./routes/apis.js";
+import { teamActionRoutes } from "./routes/team-actions.js";
 import { webchatAdminRoutes, webchatPublicRoutes } from "./routes/webchat.js";
 
 export async function buildServer() {
@@ -56,6 +57,7 @@ export async function buildServer() {
     await admin.register(integrationCheckRoutes);
     await admin.register(callbackRoutes);
     await admin.register(apiRoutes);
+    await admin.register(teamActionRoutes);
     await admin.register(webchatAdminRoutes);
   });
 

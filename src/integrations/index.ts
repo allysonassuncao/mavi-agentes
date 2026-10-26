@@ -891,19 +891,25 @@ async function notifyTeam(cfg: TeamNotifyConfig, args: Record<string, unknown>, 
   return withRepeat(ctx.conversationId, "nt", cfg.repeat, "O aviso à equipe sobre este lead", async () => ({ ...(await sendTeamNotice(cfg, message, ctx)), silent: true as const }));
 }
 
-/** O aviso pelo WhatsApp da caixa configurada (Uazapi). */
-export async function sendTeamNotice(cfg: TeamNotifyConfig, message: string, ctx: IntegrationCtx): Promise<IntegrationResult> {
-  const [inbox] = await rest<{ settings_id: number | null }[]>(`inboxes?select=settings_id&id=eq.${cfg.inbox_id}`);
+/** O endereço e o token Uazapi de uma caixa de WhatsApp por QR Code (null = não é Uazapi). */
+export async function inboxUazapi(inboxId: string): Promise<{ base_url: string; token: string } | null> {
+  const [inbox] = await rest<{ settings_id: number | null }[]>(`inboxes?select=settings_id&id=eq.${encodeURIComponent(inboxId)}`);
   const [settings] = inbox?.settings_id
     ? await rest<{ settings: { provider?: string; schema?: { base_url?: string; token?: string } } }[]>(`inbox_settings?select=settings&id=eq.${inbox.settings_id}`)
     : [];
   const schema = settings?.settings?.schema;
-  if (!schema?.base_url || !schema.token) return { result: "A caixa do aviso não é de WhatsApp por QR Code (Uazapi). Avise a equipe para corrigir." };
+  return schema?.base_url && schema.token ? { base_url: schema.base_url.replace(/\/+$/, ""), token: schema.token } : null;
+}
+
+/** O aviso pelo WhatsApp da caixa configurada (Uazapi). */
+export async function sendTeamNotice(cfg: TeamNotifyConfig, message: string, ctx: IntegrationCtx): Promise<IntegrationResult> {
+  const schema = await inboxUazapi(cfg.inbox_id);
+  if (!schema) return { result: "A caixa do aviso não é de WhatsApp por QR Code (Uazapi). Avise a equipe para corrigir." };
   const phone = ctx.phone ? `${ctx.phone.slice(0, -4).replace(/\d/g, "•")}${ctx.phone.slice(-4)}` : "";
   const link = ctx.makecrmConversationId && ctx.inboxId ? `https://app.usemakecrm.com.br/conversations/${ctx.inboxId}?chatId=${ctx.makecrmConversationId}` : "";
   const text = `🤖 ${ctx.agentName}\n${message}\n\nContato: ${ctx.contactName ?? "—"}${phone ? ` (${phone})` : ""}${link ? `\n${link}` : ""}`;
   for (const number of cfg.phones) {
-    await fetch(`${schema.base_url.replace(/\/+$/, "")}/send/text`, {
+    await fetch(`${schema.base_url}/send/text`, {
       method: "POST",
       headers: { "content-type": "application/json", token: schema.token },
       body: JSON.stringify({ number, text }),

@@ -70,6 +70,7 @@ export async function simulateRoutes(app: FastifyInstance) {
     if (body.reset) {
       await sql`delete from public.messages where conversation_id = ${conv!.id}`;
       await sql`delete from public.agent_callbacks where conversation_id = ${conv!.id}`;
+      await sql`delete from public.team_questions where conversation_id = ${conv!.id}`;
       await sql`update public.conversations set summary = '', summary_upto = null, facts = '{}', api_context = '{}', activated_at = null where id = ${conv!.id}`;
       conv!.activated_at = null;
     }
@@ -266,6 +267,7 @@ export async function simulateRoutes(app: FastifyInstance) {
         await tx`
           update public.agent_callbacks set status = 'canceled', canceled_reason = 'memória do agente zerada', canceled_by = ${by}, updated_at = now()
           where conversation_id = ${cid} and status = 'scheduled'`;
+        await tx`update public.team_questions set status = 'canceled', due_at = null, outcome = 'memória do agente zerada', updated_at = now() where conversation_id = ${cid} and status = 'open'`;
         await tx`
           update public.conversations set summary = '', summary_upto = null, facts = '{}', api_context = '{}',
             followup_step = 0, followup_state = 'idle', followup_next_at = null,

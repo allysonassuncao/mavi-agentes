@@ -9,16 +9,18 @@ export type FollowupJob = { conversationId: string; step: number; attempt?: numb
 export type ReminderJob = { conversationId: string; meetingId: string; stepId: string; startsAt: string; attempt?: number };
 /** Um retorno combinado na hora (a chave leva o horário e o minuto da varredura). */
 export type CallbackJob = { conversationId: string; callbackId: string };
+/** Consulta à equipe: a resposta chegou (o agente fala com o lead) ou não chegou a tempo. */
+export type TeamJob = { conversationId: string; questionId: string; kind: "answer" | "give_up" | "handoff"; attempt?: number };
 export type KnowledgeJob = { itemId: string };
 /** Testes com leads simulados: começar a bateria ou uma conversa dela. */
 export type TestJob = { runId: string; idx?: number };
 
-let turns: Queue<TurnJob | FollowupJob | ReminderJob | CallbackJob> | null = null;
+let turns: Queue<TurnJob | FollowupJob | ReminderJob | CallbackJob | TeamJob> | null = null;
 let knowledge: Queue<KnowledgeJob> | null = null;
 let tests: Queue<TestJob> | null = null;
 
 export function turnsQueue() {
-  turns ??= new Queue<TurnJob | FollowupJob | ReminderJob | CallbackJob>(QUEUE.turns, { connection: redisConnection() });
+  turns ??= new Queue<TurnJob | FollowupJob | ReminderJob | CallbackJob | TeamJob>(QUEUE.turns, { connection: redisConnection() });
   return turns;
 }
 export function testsQueue() {
@@ -102,4 +104,14 @@ export async function scheduleTestConversation(runId: string, idx: number) {
 export async function closeQueues() {
   await Promise.all([turns?.close(), knowledge?.close(), tests?.close()]);
   turns = knowledge = tests = null;
+}
+
+/** Uma vez própria da consulta à equipe (na fila das respostas: uma coisa por vez por conversa). */
+export async function scheduleTeam(job: TeamJob, delayMs = 0) {
+  await turnsQueue().add("team", job, {
+    delay: delayMs,
+    jobId: `tq-${job.questionId}-${job.kind}-${job.attempt ?? 0}`,
+    removeOnComplete: { count: 2000 },
+    removeOnFail: { count: 5000 },
+  });
 }

@@ -1,5 +1,6 @@
 import type { AgentSpec } from "../spec/agent.js";
 import type { CallbacksT } from "../spec/callbacks.js";
+import { TEAM_TOOL } from "../spec/team.js";
 
 const on = (spec: AgentSpec, type: string) => spec.integrations.some((i) => i.enabled && i.type === type);
 
@@ -50,4 +51,22 @@ export function callbacksPrompt(spec: AgentSpec): string {
   ];
   if (spec.callbacks.when.trim()) lines.push(`Marque retorno também: ${spec.callbacks.when.trim()}`);
   return `# Retornos combinados\n${lines.map((l) => `- ${l}`).join("\n")}`;
+}
+
+/** Consulta à equipe: quando perguntar e como segurar o lead. */
+export function teamPromptRules(spec: AgentSpec): string | null {
+  const cfg = spec.team_questions;
+  if (!cfg?.enabled) return null;
+  return (
+    "# Consulta à equipe\n" +
+    [
+      `Quando o lead perguntar algo que você não sabe (não está nas instruções, no conhecimento nem nas ferramentas), use ${TEAM_TOOL} em vez de chutar ou desviar.`,
+      cfg.never ? `Nunca consulte a equipe sobre: ${cfg.never}.` : null,
+      `Enquanto espera, diga ao lead que vai confirmar e já retorna${cfg.hold_guide ? ` (${cfg.hold_guide})` : ""}, e siga a conversa nos outros assuntos.`,
+      "Se uma dúvida já está pendente com a equipe, não pergunte de novo e não invente: se o lead cobrar, diga que está confirmando.",
+    ]
+      .filter(Boolean)
+      .map((l) => `- ${l}`)
+      .join("\n")
+  );
 }

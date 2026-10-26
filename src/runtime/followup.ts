@@ -23,6 +23,9 @@ import { integrationCtx, publishedSpec, type ConversationRow } from "./turn.js";
  * oficial com a janela de 24h fechada, só vai o modelo aprovado da etapa.
  */
 
+/** O que a IA responde quando decide não mandar a retomada. */
+export const SKIP_WORD = "NAO_ENVIAR";
+
 export type FollowupOutcome = "sent" | "skipped" | "postponed" | "stopped" | "finished" | "ignored";
 
 /** O próximo momento dentro da janela de envio (ou o próprio "agora"). */
@@ -148,6 +151,7 @@ export async function processFollowup(conversationId: string, step: number): Pro
                 `[Instrução do sistema — o lead não respondeu à sua última mensagem. Esta é a retomada ${step + 1} de ${fu.steps.length}.]\n` +
                 "Escreva UMA retomada curta e natural (1 ou 2 mensagens curtas, separadas por uma linha em branco), sem repetir o que já disse e sem saudação longa. " +
                 "Puxe o assunto de onde parou e convide o lead a responder. Responda só com o texto das mensagens.\n" +
+                `Se não fizer sentido retomar agora (o lead pediu para parar, já comprou, já tem visita marcada ou a orientação manda não enviar), responda só ${SKIP_WORD}.\n` +
                 (s.text ? `Orientação: ${s.text}\n` : "") +
                 contextBlock({ contactName: conv.contact_name, phone: conv.phone, facts: conv.facts, summary: conv.summary, retrieved: [] }),
             },
@@ -159,7 +163,9 @@ export async function processFollowup(conversationId: string, step: number): Pro
       usage = res.usage;
       model = res.model;
       await recordCost({ agentId: conv.agent_id, conversationId: conv.id, turnId, source: "followup", usage: res.usage, model: res.model, meta: { step } });
-      texts = (res.message.content ?? "")
+      // A IA decidiu não retomar agora: a etapa conta como pulada (a régua segue).
+      const raw = (res.message.content ?? "").trim();
+      texts = (raw.replace(/[.!\s]/g, "").toUpperCase() === SKIP_WORD ? "" : raw)
         .split(/\n\s*\n/)
         .map((t) => cleanText(t, spec))
         .filter(Boolean)

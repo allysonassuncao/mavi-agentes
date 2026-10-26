@@ -27,7 +27,7 @@ export function builtinTools(spec: AgentSpec): ToolDef[] {
                 type: "object",
                 properties: {
                   texto: { type: "string", description: "Texto da mensagem." },
-                  midias: { type: "array", items: { type: "string" }, description: "Códigos de mídia do conhecimento (ex.: M2) a enviar junto." },
+                  midias: { type: "array", items: { type: "string" }, description: "Códigos de mídia (do conhecimento ou da resposta de uma API, ex.: M2) a enviar junto." },
                 },
                 required: ["texto"],
               },

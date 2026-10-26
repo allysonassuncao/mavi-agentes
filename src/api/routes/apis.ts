@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { db } from "../../db.js";
-import { ApiCallError, API_FIX, apiSecret, buildRequest, forgetApiSecret, resolveValues, sendRequest, shapeResponse, statusError } from "../../integrations/apis.js";
+import { ApiCallError, API_FIX, apiSecret, buildRequest, credential, forgetApiSecret, parseOAuthSecret, resolveValues, responseMedia, sendRequest, shapeResponse, statusError } from "../../integrations/apis.js";
 import { seal, SecretsError } from "../../secrets.js";
 import { ExternalApi } from "../../spec/apis.js";
 import { HttpError, parseBody } from "../http.js";
@@ -70,7 +70,10 @@ export async function apiRoutes(app: FastifyInstance) {
       if (e instanceof SecretsError) throw new HttpError(503, e.message);
       throw e;
     }
-    const hint = body.key.length > 8 ? body.key.slice(-4) : "";
+    // Login OAuth: o final do usuário (ou do id do cliente), nunca da senha.
+    const oauth = parseOAuthSecret(body.key);
+    const shown = oauth ? oauth.username || oauth.client_id : body.key;
+    const hint = shown.length > 8 ? shown.slice(-4) : "";
     await db()`
       insert into public.agent_api_secrets (agent_id, api_id, key_cipher, key_hint, updated_by)
       values (${a.id}, ${id}, ${cipher}, ${hint}, ${body.updated_by ?? req.client!.name})
@@ -101,9 +104,13 @@ export async function apiRoutes(app: FastifyInstance) {
     const secret = api.auth.type === "none" ? null : body.key || (await apiSecret(a.id, api.id));
     let preview: ReturnType<typeof buildRequest>["preview"] | null = null;
     try {
-      const built = buildRequest(api, values, secret);
+      let built = buildRequest(api, values, await credential(api, secret));
       preview = built.preview;
-      const res = await sendRequest(built, api.timeout_seconds);
+      let res = await sendRequest(built, api.timeout_seconds);
+      if (api.auth.type === "oauth2" && res.status === 401) {
+        built = buildRequest(api, values, await credential(api, secret, true));
+        res = await sendRequest(built, api.timeout_seconds);
+      }
       const ok = res.status >= 200 && res.status < 300;
       const err = ok ? null : statusError(res.status, res.text);
       return {
@@ -114,14 +121,15 @@ export async function apiRoutes(app: FastifyInstance) {
         response: res.text.slice(0, 20_000),
         truncated: res.truncated || res.text.length > 20_000,
         paths: res.json !== null ? jsonPaths(res.json) : [],
-        result: ok ? shapeResponse(api, res) : null,
+        result: ok ? shapeResponse(api, res, values) : null,
+        media: ok ? responseMedia(api, res.json, values) : [],
         error: err?.message ?? null,
         code: err?.code ?? null,
         hint: err ? API_FIX[err.code] : null,
       };
     } catch (e) {
       const err = e instanceof ApiCallError ? e : new ApiCallError("api_network", e instanceof Error ? e.message : String(e));
-      return { ok: false, request: preview, status: null, ms: null, response: "", truncated: false, paths: [], result: null, error: err.message, code: err.code, hint: API_FIX[err.code] };
+      return { ok: false, request: preview, status: null, ms: null, response: "", truncated: false, paths: [], result: null, media: [], error: err.message, code: err.code, hint: API_FIX[err.code] };
     }
   });
 }

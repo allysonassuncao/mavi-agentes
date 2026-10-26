@@ -27,7 +27,8 @@ const fieldName = z
 export const ApiParam = z
   .object({
     name: fieldName,
-    in: z.enum(["path", "query", "body", "header"]),
+    /** filter: não vai para a API; filtra a lista da resposta pelo campo `name` de cada item (ver response.list). */
+    in: z.enum(["path", "query", "body", "header", "filter"]),
     source: z.enum(["agent", "fixed", "contact"]).default("agent"),
     description: text(300).default(""),
     type: z.enum(["string", "number", "integer", "boolean"]).default("string"),
@@ -36,6 +37,8 @@ export const ApiParam = z
     value: text(2000).default(""),
     /** Só para source=agent: valores aceitos (vira lista no modelo). */
     options: z.array(text(120).min(1)).max(30).default([]),
+    /** Só para in=filter: como comparar com o campo do item (texto sem diferenciar maiúsculas e acentos). */
+    match: z.enum(["contains", "equals", "gte", "lte"]).default("contains"),
   })
   .strict()
   .refine((p) => p.source !== "fixed" || p.value !== "", { message: "Informe o valor fixo.", path: ["value"] })
@@ -46,13 +49,59 @@ export const ApiParam = z
 
 export const ApiAuth = z
   .object({
-    /** none; bearer (Authorization: Bearer); header (chave num cabeçalho); query (chave na URL); basic (usuário:senha). */
-    type: z.enum(["none", "bearer", "header", "query", "basic"]).default("none"),
+    /**
+     * none; bearer (Authorization: Bearer); header (chave num cabeçalho); query (chave na URL); basic (usuário:senha);
+     * oauth2 (o motor pede o token em token_url com as credenciais do cofre, guarda até vencer e manda como Bearer).
+     */
+    type: z.enum(["none", "bearer", "header", "query", "basic", "oauth2"]).default("none"),
     /** Nome do cabeçalho ou do parâmetro (header/query). */
     name: text(80).default(""),
+    /** oauth2: onde pedir o token. */
+    token_url: text(1000).default(""),
+    /** oauth2: client_credentials (id e segredo do cliente) ou password (usuário e senha). */
+    grant: z.enum(["client_credentials", "password"]).default("client_credentials"),
+    scope: text(300).default(""),
+    /** oauth2: id e segredo do cliente no corpo do pedido ou em Authorization: Basic. */
+    client_auth: z.enum(["body", "basic"]).default("body"),
   })
   .strict()
-  .refine((a) => !(a.type === "header" || a.type === "query") || a.name !== "", { message: "Informe o nome do campo da chave.", path: ["name"] });
+  .refine((a) => !(a.type === "header" || a.type === "query") || a.name !== "", { message: "Informe o nome do campo da chave.", path: ["name"] })
+  .refine((a) => a.type !== "oauth2" || /^https:\/\/[^\s]+$/i.test(a.token_url), { message: "Informe o endereço do token (https://…).", path: ["token_url"] });
+
+export const AUTH_DEFAULT = { type: "none", name: "", token_url: "", grant: "client_credentials", scope: "", client_auth: "body" } as const;
+
+/** As credenciais do OAuth no cofre (um JSON na mesma chave da API). */
+export const OAuthSecret = z
+  .object({
+    client_id: z.string().trim().max(500).default(""),
+    client_secret: z.string().trim().max(2000).default(""),
+    username: z.string().trim().max(300).default(""),
+    password: z.string().max(500).default(""),
+  })
+  .strict();
+export type OAuthSecretT = z.infer<typeof OAuthSecret>;
+
+/** A resposta é (ou tem) uma lista: os itens que passam nos filtros, até max_items, cada um com os campos de pick. */
+export const ResponseList = z
+  .object({
+    /** Onde está a lista (ex.: data.veiculos); vazio = a resposta inteira é a lista. */
+    path: text(120).default(""),
+    max_items: z.number().int().min(1).max(50).default(10),
+  })
+  .strict();
+
+/** Mídias da resposta que o agente pode mandar ao lead (ex.: as fotos de um carro). */
+export const ResponseMedia = z
+  .object({
+    /** Onde está o endereço da mídia (no item, se houver lista; ex.: URL, fotos.url). */
+    path: z.string().trim().min(1).max(120),
+    type: z.enum(["image", "video", "document"]).default("image"),
+    /** Até quantas mídias por chamada. */
+    max: z.number().int().min(1).max(10).default(5),
+  })
+  .strict();
+
+const RESPONSE_DEFAULT = { pick: [], instructions: "", max_chars: 3000, list: null, media: null };
 
 export const ExternalApi = z
   .object({
@@ -75,7 +124,7 @@ export const ExternalApi = z
     params: z.array(ApiParam).max(30).default([]),
     /** Cabeçalhos fixos que não são segredo (ex.: Accept). */
     headers: z.array(z.object({ name: z.string().trim().min(1).max(80).regex(/^[A-Za-z0-9\-_]+$/), value: text(500) }).strict()).max(15).default([]),
-    auth: ApiAuth.default({ type: "none", name: "" }),
+    auth: ApiAuth.default(AUTH_DEFAULT),
     /** Corpo como JSON ou formulário (application/x-www-form-urlencoded). */
     body_format: z.enum(["json", "form"]).default("json"),
     response: z
@@ -86,9 +135,11 @@ export const ExternalApi = z
         instructions: text(1000).default(""),
         /** Até quantos caracteres da resposta vão para o agente. */
         max_chars: z.number().int().min(200).max(12_000).default(3000),
+        list: ResponseList.nullable().default(null),
+        media: ResponseMedia.nullable().default(null),
       })
       .strict()
-      .default({ pick: [], instructions: "", max_chars: 3000 }),
+      .default(RESPONSE_DEFAULT),
     /** Roda sozinha no começo da conversa e o resultado vira contexto (só com dados fixos ou do contato). */
     on_start: z.boolean().default(false),
     timeout_seconds: z.number().int().min(3).max(30).default(15),
@@ -117,6 +168,12 @@ export const ExternalApi = z
         message: "Para rodar no começo da conversa, todos os dados obrigatórios precisam ser fixos ou do contato.",
         path: ["on_start"],
       });
+    api.params.forEach((p, i) => {
+      if (p.in === "filter" && !api.response.list)
+        ctx.addIssue({ code: "custom", message: "Filtro só vale com a resposta em lista (Resposta › É uma lista).", path: ["params", i, "in"] });
+      if (p.in === "filter" && p.source === "fixed" && (p.match === "gte" || p.match === "lte") && !Number.isFinite(Number(p.value.replace(",", "."))))
+        ctx.addIssue({ code: "custom", message: "Para maior/menor, o valor fixo precisa ser número.", path: ["params", i, "value"] });
+    });
     if (api.on_start && api.kind === "write")
       ctx.addIssue({ code: "custom", message: "Só APIs de consulta rodam sozinhas no começo da conversa.", path: ["on_start"] });
   });
@@ -135,5 +192,6 @@ export const ExternalApis = z
 
 export type ExternalApiT = z.infer<typeof ExternalApi>;
 export type ApiParamT = z.infer<typeof ApiParam>;
+export type ApiAuthT = z.infer<typeof ApiAuth>;
 export const API_TOOL_PREFIX = "api_";
 export const apiToolName = (id: string) => `${API_TOOL_PREFIX}${id}`;

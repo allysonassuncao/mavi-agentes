@@ -40,6 +40,8 @@ import { Scenarios } from "./scenarios.js";
 import { MeetingReminders } from "./reminders.js";
 import { Callbacks } from "./callbacks.js";
 import { ExternalApis } from "./apis.js";
+import { Actions } from "./actions.js";
+import { TeamQuestions } from "./team.js";
 
 export const Instructions = z
   .object({
@@ -189,6 +191,10 @@ export const AgentSpec = z
     callbacks: Callbacks.nullable().default(null),
     /** APIs externas que o agente consulta ou para onde envia dados (ferramentas api_<id>). */
     apis: ExternalApis,
+    /** Contas e validações em blocos (ferramentas acao_<id>): simulação, validar CPF… */
+    actions: Actions,
+    /** Consulta à equipe: dúvida que o agente não sabe vai para a equipe e ele espera a resposta. */
+    team_questions: TeamQuestions.nullable().default(null),
     tools: z.array(ToolRef).max(40).default([]),
     automations: z.array(z.record(z.string(), z.unknown())).max(40).default([]),
   })

@@ -3,6 +3,7 @@ import { scheduleTurn } from "../queue.js";
 import { redis } from "../redis.js";
 import { activateConversation, matchActivation } from "./activation.js";
 import type { Inbound } from "./inbound.js";
+import { teamInbound, teamOn } from "./team.js";
 import { publishedSpec } from "./turn.js";
 
 /**
@@ -18,6 +19,8 @@ export const lastMessageKey = (conversationId: string) => `conv:last:${conversat
 export async function receiveMessage(binding: ReceivingBinding, msg: Inbound): Promise<string> {
   const published = await publishedSpec(binding.agent_id);
   if (!published) return "agente sem versão publicada ou pausado";
+  // A equipe respondendo uma consulta pela mesma caixa: não é lead.
+  if (teamOn(published.spec) && msg.inboxId && (await teamInbound(binding.agent_id, msg.inboxId, msg))) return "resposta da equipe";
 
   const sql = db();
   // Sem gatilho, a conversa já nasce ativa (e continua ativa se o gatilho for ligado depois).

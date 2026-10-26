@@ -34,6 +34,8 @@ export type Inbound = {
   contentType: string;
   mediaUrl: string | null;
   sourceId: string | null;
+  /** A mensagem citada (id do WhatsApp), quando a pessoa respondeu citando. */
+  replyId: string | null;
   fromMe: boolean;
   isCall: boolean;
   maviUserId: string | null;
@@ -69,6 +71,7 @@ export function normalizeInbound(raw: unknown): Inbound | { error: string } {
     contentType,
     mediaUrl: mediaUrl && /^https?:\/\//i.test(mediaUrl) ? mediaUrl : null,
     sourceId: s(d.source_id) || null,
+    replyId: s(d.reply_id) || null,
     fromMe: b(d.from_me),
     isCall: b(d.is_call),
     maviUserId: s(d.mavi_user_id) || null,

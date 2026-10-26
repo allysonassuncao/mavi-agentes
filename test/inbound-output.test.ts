@@ -75,3 +75,18 @@ describe("saída", () => {
     expect(r[1]!.text).toBe(longo.replace(/\.$/, ""));
   });
 });
+
+describe("anúncio e retomada no contexto", () => {
+  it("o texto do anúncio vai junto da mensagem do lead", async () => {
+    const { withReferral } = await import("../src/runtime/turn.js");
+    expect(withReferral("Oi, tenho interesse", { referral: { title: "Onix 2021", body: "Parcelas a partir de R$ 899" } })).toBe(
+      'Oi, tenho interesse\n[O lead chegou por um anúncio — título: "Onix 2021" — texto: "Parcelas a partir de R$ 899"]',
+    );
+    expect(withReferral("Oi", null)).toBe("Oi");
+  });
+  it("dias desde a última mensagem do agente", async () => {
+    const { contextBlock } = await import("../src/runtime/prompt.js");
+    const now = new Date("2026-10-26T15:00:00Z");
+    expect(contextBlock({ now, facts: {}, summary: "", retrieved: [], lastReplyAt: new Date("2026-10-22T10:00:00Z") })).toContain("há 4 dias");
+  });
+});

@@ -1,10 +1,12 @@
+import { sha256 } from "../crypto.js";
 import { db } from "../db.js";
 import type { ToolDef } from "../llm/client.js";
 import { log } from "../log.js";
 import { assertPublicUrl } from "../net.js";
+import { redis } from "../redis.js";
 import { unseal } from "../secrets.js";
 import type { AgentSpec } from "../spec/agent.js";
-import { API_TOOL_PREFIX, apiToolName, type ApiParamT, type ExternalApiT } from "../spec/apis.js";
+import { API_TOOL_PREFIX, apiToolName, OAuthSecret, type ApiParamT, type ExternalApiT, type OAuthSecretT } from "../spec/apis.js";
 import type { ActionDebug } from "./debug.js";
 
 /**
@@ -12,6 +14,10 @@ import type { ActionDebug } from "./debug.js";
  * a chamada (caminho, URL, cabeçalhos, corpo e a chave do cofre), chama só
  * endereços públicos e devolve ao agente a parte da resposta que interessa.
  * Na aba Testar, as consultas vão de verdade; as que enviam dados, não.
+ *
+ * Com OAuth, o motor pede o token com as credenciais do cofre e guarda até
+ * vencer. Resposta em lista: os filtros (campos "filtrar a resposta") escolhem
+ * os itens. Mídias da resposta (fotos) viram códigos que o agente manda ao lead.
  */
 
 export class ApiCallError extends Error {
@@ -187,7 +193,7 @@ export function buildRequest(api: ExternalApiT, values: Map<ApiParamT, string | 
   }
   const previewUrl = new URL(url);
   if (secret) {
-    if (api.auth.type === "bearer") {
+    if (api.auth.type === "bearer" || api.auth.type === "oauth2") {
       headers.authorization = `Bearer ${secret}`;
       shown.Authorization = `Bearer ${mask(secret)}`;
     } else if (api.auth.type === "basic") {
@@ -315,20 +321,143 @@ function getPath(obj: unknown, path: string): unknown {
   return cur;
 }
 
-/** A parte da resposta que vai para o agente: os caminhos escolhidos (ou tudo), compacta e limitada. */
-export function shapeResponse(api: ExternalApiT, res: Pick<ApiResponse, "json" | "text">): string {
-  let data: unknown = res.json ?? res.text;
-  if (res.json !== null && api.response.pick.length) {
-    const picked: Record<string, unknown> = {};
-    for (const p of api.response.pick) {
-      const v = getPath(res.json, p);
-      if (v !== undefined) picked[p] = v;
-    }
-    data = picked;
+const fold = (v: unknown) =>
+  String(v ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+const num = (v: unknown) => (typeof v === "number" ? v : Number(String(v ?? "").replace(/[^\d,.-]/g, "").replace(/\.(?=\d{3}(\D|$))/g, "").replace(",", ".")));
+
+/** O item passa no filtro? (lista no campo: basta um valor passar) */
+export function matchFilter(itemValue: unknown, wanted: string | number | boolean, match: ApiParamT["match"]): boolean {
+  if (Array.isArray(itemValue)) return itemValue.some((v) => matchFilter(v, wanted, match));
+  if (itemValue === null || itemValue === undefined) return false;
+  if (match === "gte" || match === "lte") {
+    const a = num(itemValue);
+    const b = num(wanted);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
+    return match === "gte" ? a >= b : a <= b;
   }
+  if (typeof wanted === "number" && typeof itemValue === "number") return match === "equals" ? itemValue === wanted : String(itemValue).includes(String(wanted));
+  const a = fold(itemValue);
+  const b = fold(wanted);
+  return match === "equals" ? a === b : a.includes(b);
+}
+
+type Values = Map<ApiParamT, string | number | boolean>;
+
+/** A lista da resposta já filtrada (null = a resposta não é lista ou a API não usa lista). */
+export function responseItems(api: ExternalApiT, json: unknown, values: Values = new Map()): { items: unknown[]; total: number } | null {
+  if (!api.response.list || json === null || json === undefined) return null;
+  const list = api.response.list.path ? getPath(json, api.response.list.path) : json;
+  if (!Array.isArray(list)) return null;
+  const filters = [...values].filter(([p]) => p.in === "filter");
+  const items = list.filter((it) => filters.every(([p, v]) => matchFilter(getPath(it, p.name), v, p.match)));
+  return { items, total: items.length };
+}
+
+const pickFrom = (obj: unknown, paths: string[]) => {
+  if (!paths.length) return obj;
+  const picked: Record<string, unknown> = {};
+  for (const p of paths) {
+    const v = getPath(obj, p);
+    if (v !== undefined) picked[p] = v;
+  }
+  return picked;
+};
+
+/** A parte da resposta que vai para o agente: os caminhos escolhidos (ou tudo), compacta e limitada. */
+export function shapeResponse(api: ExternalApiT, res: Pick<ApiResponse, "json" | "text">, values: Values = new Map()): string {
+  let data: unknown = res.json ?? res.text;
+  const list = responseItems(api, res.json, values);
+  if (list) {
+    const shown = list.items.slice(0, api.response.list!.max_items);
+    data = {
+      encontrados: list.total,
+      ...(list.total > shown.length ? { mostrando: shown.length } : {}),
+      itens: shown.map((it) => pickFrom(it, api.response.pick)),
+    };
+  } else if (res.json !== null && api.response.pick.length) data = pickFrom(res.json, api.response.pick);
   const out = typeof data === "string" ? data.replace(/\s+/g, " ").trim() : JSON.stringify(data);
   const max = api.response.max_chars;
   return out.length > max ? `${out.slice(0, max)}… (cortado)` : out;
+}
+
+export type ApiMedia = { url: string; mime: string; title: string };
+const MEDIA_MIME = { image: "image/jpeg", video: "video/mp4", document: "application/pdf" } as const;
+
+/** As mídias da resposta (dos itens filtrados, se for lista), só endereços http(s), sem repetir. */
+export function responseMedia(api: ExternalApiT, json: unknown, values: Values = new Map()): ApiMedia[] {
+  const cfg = api.response.media;
+  if (!cfg || json === null || json === undefined) return [];
+  const list = responseItems(api, json, values);
+  const sources = list ? list.items.slice(0, api.response.list!.max_items) : [json];
+  const urls: string[] = [];
+  for (const src of sources) {
+    const v = getPath(src, cfg.path);
+    for (const u of Array.isArray(v) ? v.flat(3) : [v])
+      if (typeof u === "string" && /^https?:\/\/\S+$/i.test(u.trim()) && !urls.includes(u.trim())) urls.push(u.trim());
+    if (urls.length >= cfg.max) break;
+  }
+  return urls.slice(0, cfg.max).map((url, i) => ({ url, mime: MEDIA_MIME[cfg.type], title: `${api.name} ${i + 1}` }));
+}
+
+// ---------------------------------------------------------------- OAuth
+
+export function parseOAuthSecret(secret: string | null): OAuthSecretT | null {
+  if (!secret) return null;
+  try {
+    const r = OAuthSecret.safeParse(JSON.parse(secret));
+    return r.success ? r.data : null;
+  } catch {
+    return null;
+  }
+}
+
+const tokenKey = (api: ExternalApiT, secret: string) => `oauth:${sha256(`${api.auth.token_url}\n${api.auth.grant}\n${api.auth.scope}\n${secret}`)}`;
+
+/** O token de acesso: do cache (até vencer) ou pedido de novo em token_url. */
+export async function oauthToken(api: ExternalApiT, secret: string | null, opts: { fresh?: boolean } = {}): Promise<string> {
+  const creds = parseOAuthSecret(secret);
+  if (!creds) throw new ApiCallError("api_no_key", `A API "${api.name}" usa login OAuth e as credenciais ainda não foram salvas.`);
+  const key = tokenKey(api, secret!);
+  if (!opts.fresh) {
+    const hit = await redis().get(key).catch(() => null);
+    if (hit) return hit;
+  }
+  const form = new URLSearchParams({ grant_type: api.auth.grant });
+  if (api.auth.scope) form.set("scope", api.auth.scope);
+  if (api.auth.grant === "password") {
+    if (!creds.username || !creds.password) throw new ApiCallError("api_no_key", `Faltam o usuário e a senha do login OAuth de "${api.name}".`);
+    form.set("username", creds.username);
+    form.set("password", creds.password);
+  } else if (!creds.client_id || !creds.client_secret) throw new ApiCallError("api_no_key", `Faltam o id e o segredo do cliente do login OAuth de "${api.name}".`);
+  const headers: Record<string, string> = { "content-type": "application/x-www-form-urlencoded", accept: "application/json", "user-agent": "MAVI-Agentes/1.0" };
+  if (creds.client_id) {
+    if (api.auth.client_auth === "basic") headers.authorization = `Basic ${Buffer.from(`${creds.client_id}:${creds.client_secret}`, "utf8").toString("base64")}`;
+    else {
+      form.set("client_id", creds.client_id);
+      if (creds.client_secret) form.set("client_secret", creds.client_secret);
+    }
+  }
+  const res = await sendRequest(
+    { method: "POST", url: api.auth.token_url, headers, body: form.toString(), preview: { method: "POST", url: api.auth.token_url, headers: {}, body: null } },
+    api.timeout_seconds,
+  );
+  const body = (res.json ?? {}) as { access_token?: unknown; expires_in?: unknown; error_description?: unknown; error?: unknown };
+  if (res.status < 200 || res.status >= 300 || typeof body.access_token !== "string" || !body.access_token) {
+    const why = String(body.error_description ?? body.error ?? res.text).replace(/\s+/g, " ").slice(0, 200);
+    throw new ApiCallError("api_auth", `O login OAuth de "${api.name}" foi recusado (${res.status}${why ? `: ${why}` : ""}).`);
+  }
+  const ttl = Math.max(60, Math.min(86_400, (Number(body.expires_in) || 3600) - 60));
+  await redis().set(key, body.access_token, "EX", ttl).catch(() => {});
+  return body.access_token;
+}
+
+/** O que vai no lugar da chave: o token (OAuth) ou a própria chave. */
+export async function credential(api: ExternalApiT, secret: string | null, fresh = false): Promise<string | null> {
+  return api.auth.type === "oauth2" ? oauthToken(api, secret, { fresh }) : secret;
 }
 
 // ---------------------------------------------------------------- cofre
@@ -360,22 +489,27 @@ export type ApiCallOutcome = {
   request: BuiltRequest["preview"];
   response: ApiResponse;
   result: string;
+  media: ApiMedia[];
 };
 
-/** Monta, chama e resume. Erro HTTP vira ApiCallError (com o pedido para o rastro). */
-export async function callApi(api: ExternalApiT, values: Map<ApiParamT, string | number | boolean>, secret: string | null): Promise<ApiCallOutcome> {
-  const req = buildRequest(api, values, secret);
-  const response = await sendRequest(req, api.timeout_seconds);
+/** Monta, chama e resume. Erro HTTP vira ApiCallError (com o pedido para o rastro). Com OAuth, 401 pede outro token uma vez. */
+export async function callApi(api: ExternalApiT, values: Values, secret: string | null): Promise<ApiCallOutcome> {
+  let req = buildRequest(api, values, await credential(api, secret));
+  let response = await sendRequest(req, api.timeout_seconds);
+  if (api.auth.type === "oauth2" && response.status === 401) {
+    req = buildRequest(api, values, await credential(api, secret, true));
+    response = await sendRequest(req, api.timeout_seconds);
+  }
   if (response.status < 200 || response.status >= 300) {
     const err = statusError(response.status, response.text);
     (err as ApiCallError & { request?: unknown }).request = req.preview;
     throw err;
   }
-  return { request: req.preview, response, result: shapeResponse(api, response) };
+  return { request: req.preview, response, result: shapeResponse(api, response, values), media: responseMedia(api, response.json, values) };
 }
 
 export type ApiToolCtx = ContactInfo & { agentId: string; simulation: boolean; spec: AgentSpec };
-export type ApiToolResult = { result: string; debug: ActionDebug; failure?: ApiCallError };
+export type ApiToolResult = { result: string; debug: ActionDebug; failure?: ApiCallError; media?: ApiMedia[] };
 
 export async function runApiTool(name: string, args: Record<string, unknown>, ctx: ApiToolCtx): Promise<ApiToolResult> {
   const api = apiOf(ctx.spec, name);
@@ -395,7 +529,7 @@ export async function runApiTool(name: string, args: Record<string, unknown>, ct
   try {
     secret = api.auth.type === "none" ? null : await apiSecret(ctx.agentId, api.id);
     if (api.kind === "write" && ctx.simulation) {
-      const req = buildRequest(api, values, secret);
+      const req = buildRequest(api, values, api.auth.type === "oauth2" ? "token-de-teste" : secret);
       return {
         result: `(Teste: nada foi enviado de verdade.) No ar, enviaria para "${api.name}": ${JSON.stringify(req.preview.body ?? req.preview.url).slice(0, 1500)}. Continue a conversa como se o envio tivesse dado certo.`,
         debug: { outcome: "simulated", summary: `Enviaria ${req.preview.method} ${req.preview.url}`, details: [JSON.stringify(req.preview).slice(0, 1500)] },
@@ -405,10 +539,11 @@ export async function runApiTool(name: string, args: Record<string, unknown>, ct
     const extra = api.response.instructions ? `\nComo usar: ${api.response.instructions}` : "";
     return {
       result: `Resposta de "${api.name}" (HTTP ${out.response.status}):\n${out.result}${extra}\nUse só o que está aqui; o que não veio, não invente.`,
+      media: out.media,
       debug: {
         outcome: ctx.simulation ? "simulated" : "ok",
         summary: `${out.request.method} ${out.request.url} → ${out.response.status} em ${out.response.ms} ms`,
-        details: [`Resposta usada: ${out.result.slice(0, 1200)}`],
+        details: [`Resposta usada: ${out.result.slice(0, 1200)}`, ...(out.media.length ? [`Mídias: ${out.media.map((m) => m.url).join(" ")}`.slice(0, 1200)] : [])],
       },
     };
   } catch (e) {

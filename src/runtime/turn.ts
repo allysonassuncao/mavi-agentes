@@ -19,10 +19,13 @@ import type { ActionDebug } from "../integrations/debug.js";
 import { spLabel } from "../integrations/time.js";
 import { finishScenario, runScenario, SCENARIO_TOOL, scenarioTool, type ScenarioHit } from "./scenarios.js";
 import { builtinTools, formatResults, RefRegistry, REPLY_TOOL } from "./tools.js";
-import { apiOf, apiTools, isApiTool, runApiTool, runStartApis, startContextLines, type StartContext } from "../integrations/apis.js";
+import { apiOf, apiTools, isApiTool, runApiTool, runStartApis, startContextLines, type ApiMedia, type StartContext } from "../integrations/apis.js";
 import { recordFailure } from "../integrations/index.js";
 import { runSiteTool, SITE_TOOLS, siteChannel } from "../webchat/agent.js";
 import { CALLBACK_TOOLS, callbackLine, callbacksOn, callbackTools, pendingCallback, runCallbackTool, turnOffAi, type CallbackHit } from "./callbacks.js";
+import { actionTools, isActionTool, runActionTool } from "./actions.js";
+import { pendingTeamLine, runTeamTool, teamOn, teamTool } from "./team.js";
+import { TEAM_TOOL } from "../spec/team.js";
 
 /**
  * Uma "vez" do agente: pega as mensagens do lead ainda sem resposta, entende as
@@ -72,6 +75,7 @@ export type ConversationRow = {
   summary_upto: string | null;
   facts: Record<string, unknown>;
   api_context: StartContext | null;
+  last_reply_at?: Date | null;
 };
 
 type MessageRow = {
@@ -79,16 +83,32 @@ type MessageRow = {
   role: "user" | "assistant" | "note";
   content: string;
   content_type: string;
-  media: { url?: string; description?: string; processed?: boolean; error?: string } | null;
+  media: { url?: string; description?: string; processed?: boolean; error?: string; referral?: Record<string, unknown> } | null;
   turn_id: string | null;
   created_at: Date;
 };
+
+/** O anúncio por onde o lead chegou (título e texto), junto da mensagem que veio dele. */
+export function withReferral(content: string, media: MessageRow["media"]): string {
+  const r = media?.referral;
+  if (!r) return content;
+  const title = typeof r.title === "string" ? r.title.trim() : "";
+  const body = typeof r.body === "string" ? r.body.trim() : "";
+  if (!title && !body) return content;
+  return `${content}\n[O lead chegou por um anúncio${title ? ` — título: "${title.slice(0, 300)}"` : ""}${body ? ` — texto: "${body.slice(0, 1500)}"` : ""}]`;
+}
 
 export type TurnOptions = {
   conversationId: string;
   /** Simulação: usa este rascunho/versão e não envia nada ao MakeCRM. */
   spec?: AgentSpec;
   agentVersion?: number | null;
+  /**
+   * Uma vez sem mensagem nova do lead, para um acontecimento (ex.: a equipe
+   * respondeu a consulta): o texto vai ao agente como aviso do sistema e a
+   * nota fica na conversa.
+   */
+  event?: { text: string; note: string; query?: string };
 };
 
 export type TurnResult = {
@@ -192,7 +212,11 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
     select id, role, content, content_type, media, turn_id, created_at from public.messages
     where conversation_id = ${conv.id} and role = 'user' and turn_id is null
     order by id`;
-  if (!pending.length) return { turnId: null, status: "skipped", messages: [], attachments: {} };
+  const event = opts.event ?? null;
+  if (!pending.length && !event) return { turnId: null, status: "skipped", messages: [], attachments: {} };
+  // Sem mensagem do lead (vez de evento): o "depois de" para saber se ele escreveu no meio.
+  const [maxRow] = pending.length ? [] : await sql<{ id: string | null }[]>`select max(id)::text as id from public.messages where conversation_id = ${conv.id}`;
+  const startedAfter = pending.length ? pending[pending.length - 1]!.id : (maxRow?.id ?? "0");
 
   const [turnRow] = await sql<{ id: string }[]>`select gen_random_uuid() as id`;
   const turnId = turnRow!.id;
@@ -231,12 +255,13 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
 
     // 3. Pré-busca no conhecimento
     tm = Date.now();
-    const pendingText = pending.map((m) => m.content).filter(Boolean).join("\n");
+    const pendingText = pending.map((m) => withReferral(m.content, m.media)).filter(Boolean).join("\n");
+    const searchText = pendingText.trim() ? pendingText : (event?.query ?? "");
     let prefetch: Retrieved[] = [];
-    if (spec.knowledge.enabled && spec.knowledge.prefetch_k > 0 && pendingText.trim()) {
+    if (spec.knowledge.enabled && spec.knowledge.prefetch_k > 0 && searchText.trim()) {
       const lastAssistant = [...history].reverse().find((h) => h.role === "assistant")?.content ?? "";
       // Mensagem curta ("e o preço?") precisa do assunto anterior para a busca.
-      const query = pendingText.length < 60 && lastAssistant ? `${lastAssistant.slice(-300)}\n${pendingText}` : pendingText;
+      const query = searchText.length < 60 && lastAssistant ? `${lastAssistant.slice(-300)}\n${searchText}` : searchText;
       const r = await searchKnowledge({ agentId: conv.agent_id, query, k: spec.knowledge.prefetch_k, rerank: spec.knowledge.rerank });
       usage = addUsage(usage, r.usage);
       await cost("retrieval", r.usage, { meta: { via: "prefetch" } });
@@ -260,13 +285,14 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
     const messages: ChatMessage[] = [{ role: "system", content: buildSystemPrompt(spec) }];
     for (const h of history) {
       // Mídia de antes do gatilho não é lida (não gasta com quem não ativou o agente).
-      if (h.role === "user") messages.push({ role: "user", content: h.content || `(${h.content_type} sem texto)` });
+      if (h.role === "user") messages.push({ role: "user", content: withReferral(h.content || `(${h.content_type} sem texto)`, h.media) });
       else messages.push({ role: "assistant", content: h.content });
     }
     messages.push({
       role: "user",
       content:
-        `${pendingText || "(mensagem sem texto)"}\n\n` +
+        (event ? `[Aviso do sistema — não é mensagem do lead] ${event.text}\n\n` : "") +
+        (pending.length ? `${pendingText || "(mensagem sem texto)"}\n\n` : "") +
         contextBlock({
           contactName: conv.contact_name,
           phone: conv.phone,
@@ -277,13 +303,24 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
           callback: callbacksOn(spec) ? await pendingCallback(conv.id).then((c) => (c ? callbackLine(c) : null)) : null,
           apis: startContextLines(startApis.context),
           channel: site?.line ?? null,
+          team: teamOn(spec) ? await pendingTeamLine(conv.id) : null,
+          lastReplyAt: conv.last_reply_at ?? null,
         }),
     });
 
     // 5. LLM + ferramentas
     tm = Date.now();
     const sc = scenarioTool(spec);
-    const tools = [...builtinTools(spec), ...integrationTools(spec), ...apiTools(spec), ...(site?.tools ?? []), ...(sc ? [sc] : []), ...callbackTools(spec)];
+    const tools = [
+      ...builtinTools(spec),
+      ...integrationTools(spec),
+      ...apiTools(spec),
+      ...actionTools(spec),
+      ...teamTool(spec),
+      ...(site?.tools ?? []),
+      ...(sc ? [sc] : []),
+      ...callbackTools(spec),
+    ];
     // O que as integrações precisam saber da conversa (MakeCRM, contato, resumo).
     const ictx = await integrationCtx(conv, spec);
     let reply: ReplyMessage[] | null = null;
@@ -386,10 +423,26 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
               const r = await runSiteTool(site, call.function.name, args);
               result = r.result;
               debug = r.debug;
+            } else if (isActionTool(call.function.name)) {
+              const r = runActionTool(spec, call.function.name, args, ictx);
+              result = r.result;
+              debug = r.debug;
+              // Dados validados e contas marcadas para guardar: não pergunta de novo.
+              if (Object.keys(r.facts).length) {
+                conv.facts = { ...conv.facts, ...r.facts };
+                ictx.facts = conv.facts;
+                await sql`update public.conversations set facts = facts || ${sql.json(r.facts as never)} where id = ${conv.id}`;
+              }
+            } else if (call.function.name === TEAM_TOOL && teamOn(spec)) {
+              const r = await runTeamTool(args, ictx, turnId);
+              result = r.result;
+              debug = r.debug;
             } else if (isApiTool(call.function.name)) {
               const r = await runApiTool(call.function.name, args, ictx);
               result = r.result;
               debug = r.debug;
+              // Mídias da resposta (ex.: fotos do carro) ganham código como as do conhecimento.
+              if (r.media?.length) result += `\nMídias desta resposta (para enviar, ponha o código em midias): ${registerApiMedia(reg, r.media).join(", ")}`;
               if (r.failure) await recordFailure(call.function.name, r.failure, ictx).catch((e) => log.warn({ err: String(e) }, "turn: falha da API não registrada"));
             } else if (INTEGRATION_TOOL_NAMES.has(call.function.name)) {
               const r = await runIntegrationTool(call.function.name, args, ictx);
@@ -418,12 +471,13 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
 
     // O lead mandou mais enquanto o agente pensava: descarta esta resposta (fica
     // no rastro, com o custo) e a próxima vez responde a tudo de uma vez.
-    const lastPendingId = pending[pending.length - 1]!.id;
+    const lastPendingId = startedAfter;
     // Se já marcou reunião, moveu oportunidade etc., não refaz (repetiria a ação): envia.
     // Consultas a APIs externas também podem ser refeitas; as que enviam dados, não.
-    const redoable = toolLog.every((t) => SAFE_TO_REDO.has(t.name) || (isApiTool(t.name) && apiOf(spec, t.name)?.kind !== "write"));
+    const redoable = toolLog.every((t) => SAFE_TO_REDO.has(t.name) || isActionTool(t.name) || (isApiTool(t.name) && apiOf(spec, t.name)?.kind !== "write"));
     if (
       live &&
+      !event &&
       redoable &&
       Date.now() - pending[0]!.created_at.getTime() < SUPERSEDE_MAX_MS &&
       (await newerLeadMessage(conv.id, lastPendingId))
@@ -510,7 +564,8 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
     // 8. Registro
     const status = reply.length ? "done" : "silent";
     await sql.begin(async (tx) => {
-      await tx`update public.messages set turn_id = ${turnId} where id in ${tx(pending.map((m) => m.id))}`;
+      if (pending.length) await tx`update public.messages set turn_id = ${turnId} where id in ${tx(pending.map((m) => m.id))}`;
+      if (event) await tx`insert into public.messages (conversation_id, role, content, turn_id) values (${conv.id}, 'note', ${event.note.slice(0, 2000)}, ${turnId})`;
       for (const m of reply!) {
         await tx`
           insert into public.messages (conversation_id, role, content, content_type, media, turn_id)
@@ -577,6 +632,14 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
     // As mensagens ficam pendentes: a próxima mensagem do lead tenta de novo com elas.
     return { turnId, status: "error", messages: [], attachments: {}, error };
   }
+}
+
+/** As mídias vindas de uma API entram no registro da vez (M1, M2…) e podem ir junto da resposta. */
+export function registerApiMedia(reg: RefRegistry, media: ApiMedia[]): string[] {
+  return media.map((m) => {
+    const ref = reg.add({ chunk_id: `api:${m.url}`, item_id: "", kind: "media", title: m.title, content: "", context: "", meta: { url: m.url, mime: m.mime }, score: 0, vector_rank: null, keyword_rank: null });
+    return `${ref} (${m.title})`;
+  });
 }
 
 const MEDIA_SOURCE: Record<string, CostSource> = {

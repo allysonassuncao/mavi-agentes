@@ -14,9 +14,12 @@ import {
   type FollowupJob,
   type KnowledgeJob,
   type ReminderJob,
+  type TeamJob,
   type TestJob,
   type TurnJob,
+  scheduleTeam,
 } from "./queue.js";
+import { processTeamEvent, teamRepliesTick, teamTimeoutTick } from "./runtime/team.js";
 import { confirmationAlert, processReminder, stepState, type MeetingRow } from "./runtime/reminders.js";
 import { runConversation, startRun } from "./tests/runner.js";
 import { db } from "./db.js";
@@ -93,6 +96,30 @@ export async function processCallbackJob(job: CallbackJob): Promise<string> {
   } finally {
     await redis().eval(RELEASE, 1, lockKey(job.conversationId), token);
   }
+}
+
+/** Uma vez da consulta à equipe (a resposta chegou ou não chegou a tempo), com a trava da conversa. */
+export async function processTeamJob(job: TeamJob): Promise<string> {
+  const token = randomUUID();
+  const locked = await redis().set(lockKey(job.conversationId), token, "PX", LOCK_MS, "NX");
+  if (!locked) {
+    if ((job.attempt ?? 0) < 120) await scheduleTeam({ ...job, attempt: (job.attempt ?? 0) + 1 }, 3000);
+    return "aguardando a resposta em andamento";
+  }
+  try {
+    return await processTeamEvent(job.questionId, job.kind);
+  } finally {
+    await redis().eval(RELEASE, 1, lockKey(job.conversationId), token);
+  }
+}
+
+/** A cada minuto (com trava): as respostas da equipe que chegaram no MakeCRM e as dúvidas vencidas. */
+async function teamTick() {
+  const ok = await redis().set("tq:tick", "1", "PX", 55_000, "NX");
+  if (!ok) return;
+  const replies = await teamRepliesTick();
+  const due = await teamTimeoutTick();
+  if (replies || due) log.info({ replies, due }, "consulta à equipe: rodada");
 }
 
 /**
@@ -192,7 +219,7 @@ export function startWorkers() {
   void db()`select public.cost_backfill() as n`
     .then(([r]) => r?.n && log.info({ n: r.n }, "custos: gastos antigos registrados"))
     .catch((e) => log.warn({ err: String(e) }, "custos: backfill falhou"));
-  const turns = new Worker<TurnJob | FollowupJob | ReminderJob | CallbackJob>(
+  const turns = new Worker<TurnJob | FollowupJob | ReminderJob | CallbackJob | TeamJob>(
     QUEUE.turns,
     async (job) =>
       job.name === "followup"
@@ -201,7 +228,9 @@ export function startWorkers() {
           ? processReminderJob(job.data as ReminderJob)
           : job.name === "callback"
             ? processCallbackJob(job.data as CallbackJob)
-            : processTurn(job.data as TurnJob),
+            : job.name === "team"
+              ? processTeamJob(job.data as TeamJob)
+              : processTurn(job.data as TurnJob),
     {
     connection: redisConnection(true),
     concurrency: config().WORKER_CONCURRENCY,
@@ -224,6 +253,7 @@ export function startWorkers() {
     void followupTick().catch((e) => log.error({ err: String(e) }, "follow-up: varredura falhou"));
     void remindersTick().catch((e) => log.error({ err: String(e) }, "pré-reunião: varredura falhou"));
     void callbacksTick().catch((e) => log.error({ err: String(e) }, "retornos: varredura falhou"));
+    void teamTick().catch((e) => log.error({ err: String(e) }, "consulta à equipe: varredura falhou"));
   }, 60_000);
   const insights = setInterval(() => void insightsTick().catch((e) => log.error({ err: String(e) }, "insights: rodada falhou")), 2 * 60_000);
   turns.on("closing", () => {

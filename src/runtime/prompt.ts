@@ -1,6 +1,6 @@
 import type { AgentSpec } from "../spec/agent.js";
 import type { WeeklyHours } from "../spec/weekly-hours.js";
-import { callbacksPrompt, integrationsPrompt, scenarioPrompt } from "../integrations/prompt.js";
+import { callbacksPrompt, integrationsPrompt, scenarioPrompt, teamPromptRules } from "../integrations/prompt.js";
 
 const DAY_NAMES: [keyof WeeklyHours, string][] = [
   ["mon", "Segunda"],
@@ -85,7 +85,7 @@ export function buildSystemPrompt(spec: AgentSpec): string {
       knowledgeRules.push("Se os trechos não bastarem, pesquise com a ferramenta buscar_conhecimento antes de dizer que não sabe.");
     }
     knowledgeRules.push(
-      "Mídias do conhecimento têm um código (ex.: M2). Para enviar uma, coloque o código em `midias` da mensagem certa na ferramenta responder. Nunca escreva links de mídia no texto.",
+      "Mídias do conhecimento e das respostas das APIs têm um código (ex.: M2). Para enviar uma, coloque o código em `midias` da mensagem certa na ferramenta responder. Nunca escreva links de mídia no texto.",
     );
   }
   knowledgeRules.push("Se não encontrar a informação, diga com naturalidade que vai confirmar e siga a conversa; não chute.");
@@ -93,6 +93,10 @@ export function buildSystemPrompt(spec: AgentSpec): string {
 
   const actions = integrationsPrompt(spec);
   if (actions) parts.push(actions);
+  if (spec.actions.some((a) => a.enabled))
+    parts.push("# Contas e validações\n- Para as contas e validações que têm ferramenta (acao_…), use a ferramenta e o resultado como veio: nunca faça a conta de cabeça nem valide um documento por conta própria.");
+  const team = teamPromptRules(spec);
+  if (team) parts.push(team);
   const scenarios = scenarioPrompt(spec);
   if (scenarios) parts.push(scenarios);
   const callbacks = callbacksPrompt(spec);
@@ -187,8 +191,16 @@ export function contextBlock(input: {
   apis?: string[];
   /** Chat do site: o canal e o que fazer com os dados do visitante. */
   channel?: string | null;
+  /** Dúvidas deste lead que estão com a equipe, sem resposta. */
+  team?: string | null;
+  /** A última mensagem do agente para este lead (para saber se é retomada de conversa antiga). */
+  lastReplyAt?: Date | null;
 }): string {
   const lines: string[] = [`Agora: ${nowInBrazil(input.now)}`];
+  if (input.lastReplyAt) {
+    const days = Math.floor(((input.now ?? new Date()).getTime() - input.lastReplyAt.getTime()) / 86_400_000);
+    lines.push(`Sua última mensagem para este lead: ${days <= 0 ? "hoje" : days === 1 ? "há 1 dia" : `há ${days} dias`}.`);
+  }
   if (input.channel) lines.push(input.channel);
   const who = [input.contactName && `nome no WhatsApp: ${input.contactName}`, input.phone && `telefone: ${input.phone}`].filter(Boolean);
   if (who.length) lines.push(`Contato: ${who.join(", ")}`);
@@ -196,6 +208,7 @@ export function contextBlock(input: {
   if (facts.length) lines.push(`Dados já registrados do contato: ${facts.map(([k, v]) => `${k}: ${String(v)}`).join("; ")}`);
   if (input.meeting) lines.push(`Reunião marcada com este lead: ${input.meeting}`);
   if (input.callback) lines.push(`Retorno combinado com este lead: ${input.callback}`);
+  if (input.team) lines.push(`[PENDENTE COM A EQUIPE] Você já perguntou e ainda não houve resposta: ${input.team}. Não pergunte de novo e não invente; se o lead cobrar, diga que está confirmando.`);
   if (input.apis?.length) lines.push(`Dados de outros sistemas da empresa (consultados no começo da conversa):\n${input.apis.map((a) => `- ${a}`).join("\n")}`);
   if (input.summary.trim()) lines.push(`Resumo das mensagens anteriores:\n${input.summary.trim()}`);
   if (input.retrieved.length) {

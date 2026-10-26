@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { apiTools, buildRequest, resolveValues, runApiTool, shapeResponse, statusError } from "../src/integrations/apis.js";
+import { apiTools, buildRequest, matchFilter, parseOAuthSecret, resolveValues, responseMedia, runApiTool, shapeResponse, statusError } from "../src/integrations/apis.js";
 import { jsonPaths } from "../src/api/routes/apis.js";
 import { parseSpec } from "../src/spec/agent.js";
 import { ExternalApi } from "../src/spec/apis.js";
@@ -149,5 +149,79 @@ describe("na conversa", () => {
 
   it("contexto com os dados do começo da conversa", () => {
     expect(contextBlock({ facts: {}, summary: "", retrieved: [], apis: ["Cliente: {\"plano\":\"ouro\"}"] })).toContain("Dados de outros sistemas");
+  });
+});
+
+describe("lista, filtros e mídias da resposta", () => {
+  const estoque = ExternalApi.parse({
+    id: "estoque",
+    name: "Estoque",
+    when: "Quando o lead perguntar de um carro",
+    url: "https://api.loja.com/estoque",
+    params: [
+      { name: "Modelo", in: "filter", description: "Modelo", required: false },
+      { name: "Preco", in: "filter", source: "fixed", value: "50000", match: "gte" },
+    ],
+    response: { list: { path: "", max_items: 2 }, pick: ["Codigo", "Modelo", "Preco"], media: { path: "Fotos.URL", max: 3 } },
+  });
+  const json = [
+    { Codigo: 1, Modelo: "ÔNIX LT", Preco: 68900, Fotos: [{ URL: "https://f.com/1a.jpg" }, { URL: "https://f.com/1b.jpg" }] },
+    { Codigo: 2, Modelo: "Onix Plus", Preco: 79900, Fotos: [{ URL: "https://f.com/2a.jpg" }, { URL: "javascript:alert(1)" }] },
+    { Codigo: 3, Modelo: "HB20", Preco: 59900, Fotos: [] },
+    { Codigo: 4, Modelo: "Onix", Preco: 39900, Fotos: [{ URL: "https://f.com/4a.jpg" }] },
+  ];
+
+  it("filtro só vale com lista", () => {
+    const r = ExternalApi.safeParse({ ...base, params: [...base.params, { name: "Modelo", in: "filter" }] });
+    expect(r.success).toBe(false);
+  });
+
+  it("filtra sem acento e maiúsculas, compara número e corta em max_items", () => {
+    const { values } = resolveValues(estoque, { Modelo: "onix" }, { phone: null, contactName: null, facts: {} });
+    const out = JSON.parse(shapeResponse(estoque, { json, text: "" }, values));
+    expect(out.encontrados).toBe(2);
+    expect(out.itens.map((i: { Codigo: number }) => i.Codigo)).toEqual([1, 2]);
+    expect(out.itens[0]).toEqual({ Codigo: 1, Modelo: "ÔNIX LT", Preco: 68900 });
+  });
+
+  it("sem o filtro do agente, só o fixo vale", () => {
+    const { values } = resolveValues(estoque, {}, { phone: null, contactName: null, facts: {} });
+    const out = JSON.parse(shapeResponse(estoque, { json, text: "" }, values));
+    expect(out.encontrados).toBe(3);
+    expect(out.mostrando).toBe(2);
+  });
+
+  it("mídias dos itens filtrados, só http(s), até o máximo", () => {
+    const { values } = resolveValues(estoque, { Modelo: "onix" }, { phone: null, contactName: null, facts: {} });
+    const media = responseMedia(estoque, json, values);
+    expect(media.map((m) => m.url)).toEqual(["https://f.com/1a.jpg", "https://f.com/1b.jpg", "https://f.com/2a.jpg"]);
+    expect(media[0]!.mime).toBe("image/jpeg");
+  });
+
+  it("matchFilter: contém, igual, maior e menor", () => {
+    expect(matchFilter("Automático", "automatico", "contains")).toBe(true);
+    expect(matchFilter("Prata", "prat", "equals")).toBe(false);
+    expect(matchFilter("R$ 68.900,00", 60000, "gte")).toBe(true);
+    expect(matchFilter(2019, "2020", "lte")).toBe(true);
+    expect(matchFilter(["Preto", "Prata"], "prata", "equals")).toBe(true);
+  });
+});
+
+describe("login OAuth", () => {
+  const oauth = { ...base, auth: { type: "oauth2", token_url: "https://api.loja.com/oauth/token", grant: "password" } };
+
+  it("pede o endereço do token", () => {
+    expect(ExternalApi.safeParse({ ...base, auth: { type: "oauth2" } }).success).toBe(false);
+    expect(ExternalApi.safeParse(oauth).success).toBe(true);
+  });
+
+  it("as credenciais são um JSON no cofre; o token vai como Bearer mascarado", () => {
+    expect(parseOAuthSecret('{"username":"loja","password":"x"}')).toMatchObject({ username: "loja", password: "x", client_id: "" });
+    expect(parseOAuthSecret("chave-simples")).toBeNull();
+    const api = ExternalApi.parse(oauth);
+    const { values } = resolveValues(api, { numero: "7" }, { phone: null, contactName: null, facts: {} });
+    const req = buildRequest(api, values, "token-abcdefgh1234");
+    expect(req.headers.authorization).toBe("Bearer token-abcdefgh1234");
+    expect(req.preview.headers.Authorization).toBe("Bearer ••••1234");
   });
 });

@@ -154,6 +154,7 @@ export async function visitorSend(inbox: WebchatInbox, session: Session, text: s
         contentType: "text",
         mediaUrl: null,
         sourceId: `wc:${crm.id}`,
+        replyId: null,
         fromMe: false,
         isCall: false,
         maviUserId: await maviUserId(inbox.company_id),
