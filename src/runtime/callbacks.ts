@@ -18,6 +18,7 @@ import type { WeeklyHours } from "../spec/weekly-hours.js";
 import { nextOpening } from "./followup.js";
 import { cleanText, typingDelayMs } from "./output.js";
 import { buildSystemPrompt, contextBlock } from "./prompt.js";
+import { startFollowup } from "./followup-track.js";
 import { integrationCtx, meetingLine, publishedSpec, type ConversationRow } from "./turn.js";
 
 /**
@@ -568,7 +569,7 @@ export async function processCallback(callbackId: string): Promise<string> {
   // A régua: conta a partir da mensagem de retorno (restart) ou fica parada.
   const fu = spec.followup;
   if (sent && cfg.followup.after === "restart" && fu?.enabled && fu.steps.length && !cfg.on_due.stop_followup && !cfg.on_due.turn_off_ai)
-    await sql`update public.conversations set followup_step = 0, followup_state = 'active', followup_next_at = now() + make_interval(mins => ${fu.steps[0]!.after_minutes}) where id = ${conv.id}`;
+    await startFollowup(fu, conv).catch((e) => log.warn({ err: String(e) }, "retorno: follow-up não recomeçou"));
   else if (cfg.followup.after === "stop") await sql`update public.conversations set followup_next_at = null, followup_state = 'idle' where id = ${conv.id}`;
 
   const status: CallbackRow["status"] = error ? "failed" : sent || cfg.contact === "team" || done.length ? "done" : "skipped";

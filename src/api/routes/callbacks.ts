@@ -5,6 +5,7 @@ import { scheduleCallback } from "../../queue.js";
 import { manualCreated, maxDaysFor, validManualDue, type CallbackRow } from "../../runtime/callbacks.js";
 import { publishedSpec } from "../../runtime/turn.js";
 import { assertUuid, HttpError, notFound, parseBody } from "../http.js";
+import { startFollowup } from "../../runtime/followup-track.js";
 import { loadAgent } from "./agents.js";
 
 /**
@@ -138,11 +139,13 @@ export async function callbackRoutes(app: FastifyInstance) {
     // A régua estava esperando o retorno: volta a contar a partir de agora (se o lead não estiver esperando resposta).
     const spec = (await publishedSpec(a.id).catch(() => null))?.spec;
     const fu = spec?.followup;
-    if (spec?.callbacks?.followup.during === "pause" && spec.callbacks.followup.after === "restart" && fu?.enabled && fu.steps.length)
-      await db()`
-        update public.conversations set followup_step = 0, followup_state = 'active', followup_next_at = now() + make_interval(mins => ${fu.steps[0]!.after_minutes})
-        where id = ${cb.conversation_id} and followup_state = 'idle'
-          and (select role from public.messages m where m.conversation_id = ${cb.conversation_id} and m.role in ('user', 'assistant') order by m.id desc limit 1) = 'assistant'`;
+    if (spec?.callbacks?.followup.during === "pause" && spec.callbacks.followup.after === "restart" && fu?.enabled && fu.steps.length) {
+      const [conv] = await db()<{ id: string; simulation: boolean; external_id: string }[]>`
+        select c.id, c.simulation, c.external_id from public.conversations c
+        where c.id = ${cb.conversation_id} and c.followup_state = 'idle'
+          and (select role from public.messages m where m.conversation_id = c.id and m.role in ('user', 'assistant') order by m.id desc limit 1) = 'assistant'`;
+      if (conv) await startFollowup(fu, conv).catch(() => {});
+    }
     return { ok: true };
   });
 

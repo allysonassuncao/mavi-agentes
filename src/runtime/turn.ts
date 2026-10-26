@@ -26,6 +26,7 @@ import { CALLBACK_TOOLS, callbackLine, callbacksOn, callbackTools, pendingCallba
 import { actionTools, isActionTool, runActionTool } from "./actions.js";
 import { pendingTeamLine, runTeamTool, teamOn, teamTool } from "./team.js";
 import { TEAM_TOOL } from "../spec/team.js";
+import { startFollowup } from "./followup-track.js";
 
 /**
  * Uma "vez" do agente: pega as mensagens do lead ainda sem resposta, entende as
@@ -607,10 +608,8 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
     if (live && waitCallback) {
       await sql`update public.conversations set followup_next_at = null, followup_state = 'idle' where id = ${conv.id}`;
     } else if (live && status === "done" && !handoff && !stopFollowup && fu?.enabled && fu.steps.length) {
-      await sql`
-        update public.conversations set followup_step = 0, followup_state = 'active',
-          followup_next_at = now() + make_interval(mins => ${fu.steps[0]!.after_minutes})
-        where id = ${conv.id}`;
+      // Na trilha da etapa do funil do lead (fora das etapas escolhidas, fica parada).
+      await startFollowup(fu, conv).catch((e) => log.warn({ err: String(e) }, "turn: follow-up não começou"));
     } else if (live && (handoff || stopFollowup)) {
       await sql`update public.conversations set followup_next_at = null, followup_state = 'idle' where id = ${conv.id}`;
     }

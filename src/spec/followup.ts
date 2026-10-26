@@ -31,10 +31,30 @@ export const FollowupStep = z
   .strict()
   .refine((s) => s.mode === "ai" || s.text.length > 0, "Etapa com texto fixo precisa do texto.");
 
+/**
+ * Uma etapa do funil do MakeCRM em que a régua vale. Sem etapas, vale para
+ * todos os leads; com etapas, só para quem tem oportunidade aberta numa delas
+ * (ou ainda não tem oportunidade). A etapa pode ter a régua dela; sem etapas
+ * próprias, usa a régua padrão.
+ */
+export const FollowupStage = z
+  .object({
+    pipeline_id: z.string().uuid(),
+    stage_id: z.string().uuid(),
+    steps: z.array(FollowupStep).max(10).default([]),
+  })
+  .strict();
+
 export const Followup = z
   .object({
     enabled: z.boolean().default(true),
     steps: z.array(FollowupStep).min(1).max(10),
+    /** As etapas do funil em que a régua vale (vazio = todas). */
+    stages: z
+      .array(FollowupStage)
+      .max(60)
+      .default([])
+      .refine((l) => new Set(l.map((s) => s.stage_id)).size === l.length, "A mesma etapa duas vezes."),
     /** Só envia nestes dias/horários (fora deles, espera abrir). Nulo: qualquer hora. */
     window: WeeklyHours.nullable().default(null),
     /** Não retoma quem já tem reunião marcada pelo agente. */
@@ -54,3 +74,4 @@ export const Followup = z
 
 export type FollowupT = z.infer<typeof Followup>;
 export type FollowupStepT = z.infer<typeof FollowupStep>;
+export type FollowupStageT = z.infer<typeof FollowupStage>;

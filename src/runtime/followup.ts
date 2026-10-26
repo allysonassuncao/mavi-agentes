@@ -15,6 +15,7 @@ import type { WeeklyHours } from "../spec/weekly-hours.js";
 import { cleanText, typingDelayMs } from "./output.js";
 import { buildSystemPrompt, contextBlock } from "./prompt.js";
 import { integrationCtx, publishedSpec, type ConversationRow } from "./turn.js";
+import { currentTrack, trackSteps } from "./followup-track.js";
 
 /**
  * Uma etapa da régua de follow-up. Confere de novo, na hora, se ainda vale:
@@ -50,7 +51,7 @@ const fill = (text: string, vars: Record<string, string>) => text.replace(/\{(no
 
 export async function processFollowup(conversationId: string, step: number): Promise<FollowupOutcome> {
   const sql = db();
-  const [conv] = await sql<(ConversationRow & { followup_step: number; followup_next_at: Date | null; followup_state: string })[]>`
+  const [conv] = await sql<(ConversationRow & { followup_step: number; followup_next_at: Date | null; followup_state: string; followup_track: string | null })[]>`
     select * from public.conversations where id = ${conversationId}`;
   if (!conv || conv.simulation || conv.followup_state !== "active" || conv.followup_step !== step) return "ignored";
   if (!conv.followup_next_at || conv.followup_next_at.getTime() > Date.now() + 5_000) return "ignored";
@@ -61,9 +62,23 @@ export async function processFollowup(conversationId: string, step: number): Pro
   };
   const published = await publishedSpec(conv.agent_id);
   const fu: FollowupT | null = published?.spec.followup ?? null;
-  if (!published || !fu?.enabled || !fu.steps[step]) return stop();
+  if (!published || !fu?.enabled) return stop();
   const spec = published.spec;
-  const s: FollowupStepT = fu.steps[step];
+  // A etapa do funil agora: saiu das etapas da régua, para; foi para uma etapa com outra régua, recomeça por ela.
+  const track = await currentTrack(fu, conv).catch((e) => {
+    log.warn({ conversationId: conv.id, err: e instanceof Error ? e.message : String(e) }, "follow-up: etapa do funil não lida");
+    return { key: conv.followup_track ?? "default", steps: trackSteps(fu, conv.followup_track) };
+  });
+  if (!track) return stop();
+  if (track.key !== (conv.followup_track ?? "default")) {
+    if (!track.steps.length) return stop();
+    await sql`update public.conversations set followup_step = 0, followup_track = ${track.key},
+      followup_next_at = now() + make_interval(mins => ${track.steps[0]!.after_minutes}) where id = ${conv.id}`;
+    return "postponed";
+  }
+  const steps = track.steps;
+  if (!steps[step]) return stop();
+  const s: FollowupStepT = steps[step];
 
   // O lead respondeu depois da última mensagem do agente?
   const [last] = await sql<{ role: string }[]>`
@@ -148,7 +163,7 @@ export async function processFollowup(conversationId: string, step: number): Pro
             {
               role: "user",
               content:
-                `[Instrução do sistema — o lead não respondeu à sua última mensagem. Esta é a retomada ${step + 1} de ${fu.steps.length}.]\n` +
+                `[Instrução do sistema — o lead não respondeu à sua última mensagem. Esta é a retomada ${step + 1} de ${steps.length}.]\n` +
                 "Escreva UMA retomada curta e natural (1 ou 2 mensagens curtas, separadas por uma linha em branco), sem repetir o que já disse e sem saudação longa. " +
                 "Puxe o assunto de onde parou e convide o lead a responder. Responda só com o texto das mensagens.\n" +
                 `Se não fizer sentido retomar agora (o lead pediu para parar, já comprou, já tem visita marcada ou a orientação manda não enviar), responda só ${SKIP_WORD}.\n` +
@@ -191,7 +206,7 @@ export async function processFollowup(conversationId: string, step: number): Pro
   }
 
   // Registro e próxima etapa
-  const next = fu.steps[step + 1];
+  const next = steps[step + 1];
   await sql.begin(async (tx) => {
     for (const t of texts)
       await tx`insert into public.messages (conversation_id, role, content, turn_id, meta) values (${conv.id}, 'assistant', ${t}, ${turnId}, ${tx.json({ followup: step } as never)})`;

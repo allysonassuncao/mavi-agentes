@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { nextOpening } from "../src/runtime/followup.js";
 import { parseSpec } from "../src/spec/agent.js";
 import { templateBody } from "../src/makecrm/client.js";
+import { Followup } from "../src/spec/followup.js";
 
 describe("régua de follow-up", () => {
   const base = { persona: { name: "Clara", company: "X" }, instructions: { goal: "y" } };
@@ -45,5 +46,37 @@ describe("régua de follow-up", () => {
       },
     });
     expect(b).toEqual({ text: "Oi {{1}}, tudo bem? Ainda tem interesse em {{2}}?", examples: ["Ana", "consórcio"], language: "pt_BR", name: "retomada" });
+  });
+});
+
+describe("follow-up por funil e etapa", () => {
+  const P = "35eac71d-fc2f-48ab-b55f-819a21940b1a";
+  const NOVOS = "1d3fa199-1627-45b3-9c06-c4973f2c9e45";
+  const CONECTADO = "4df79316-fe35-4175-b6dd-2edbaf3fa980";
+  const AGENDADO = "98bb245f-663d-4166-987c-56f02bf688e0";
+  const base = { steps: [{ id: "a", after_minutes: 30 }, { id: "b", after_minutes: 120 }] };
+
+  it("sem etapas: a régua padrão para todos", async () => {
+    const { pickTrack } = await import("../src/runtime/followup-track.js");
+    const fu = Followup.parse(base);
+    expect(fu.stages).toEqual([]);
+    expect(pickTrack(fu, [{ pipeline_id: P, stage_id: AGENDADO }])?.key).toBe("default");
+  });
+
+  it("com etapas: fora delas não recebe; sem oportunidade, a padrão; etapa com régua própria", async () => {
+    const { pickTrack, trackSteps } = await import("../src/runtime/followup-track.js");
+    const fu = Followup.parse({ ...base, stages: [{ pipeline_id: P, stage_id: NOVOS, steps: [{ id: "n1", after_minutes: 10 }] }, { pipeline_id: P, stage_id: CONECTADO }] });
+    expect(pickTrack(fu, [{ pipeline_id: P, stage_id: AGENDADO }])).toBeNull();
+    expect(pickTrack(fu, [])?.key).toBe("default");
+    expect(pickTrack(fu, [{ pipeline_id: P, stage_id: CONECTADO }])).toEqual({ key: "default", steps: fu.steps });
+    const novos = pickTrack(fu, [{ pipeline_id: P, stage_id: AGENDADO }, { pipeline_id: P, stage_id: NOVOS }]);
+    expect(novos?.key).toBe(NOVOS);
+    expect(novos?.steps.map((s) => s.id)).toEqual(["n1"]);
+    expect(trackSteps(fu, NOVOS).map((s) => s.id)).toEqual(["n1"]);
+    expect(trackSteps(fu, "etapa-que-saiu").map((s) => s.id)).toEqual(["a", "b"]);
+  });
+
+  it("a mesma etapa duas vezes não vale", () => {
+    expect(Followup.safeParse({ ...base, stages: [{ pipeline_id: P, stage_id: NOVOS }, { pipeline_id: P, stage_id: NOVOS }] }).success).toBe(false);
   });
 });
