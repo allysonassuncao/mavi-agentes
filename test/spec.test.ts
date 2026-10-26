@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseSpec } from "../src/spec/agent.js";
+import { parseSpec, specSchema } from "../src/spec/agent.js";
 import { buildSystemPrompt, contextBlock } from "../src/runtime/prompt.js";
 
 const minimal = { persona: { name: "Clara", company: "Make Vendas" }, instructions: { goal: "Qualificar leads e agendar reunião." } };
@@ -67,5 +67,14 @@ describe("prompt", () => {
     expect(b).toContain("quinta-feira, 08/10/2026, 12:30");
     expect(b).toContain("email: ana@x.com");
     expect(b).toContain("[K1] (pergunta e resposta) Preço: A partir de R$ 99.");
+  });
+});
+
+describe("o formato do rascunho em JSON Schema", () => {
+  it("traz as partes pedidas, com os padrões de entrada", () => {
+    const all = specSchema() as { properties: Record<string, unknown> };
+    expect(Object.keys(all.properties)).toContain("apis");
+    const some = specSchema(["apis", "followup", "nao_existe"]) as { properties: Record<string, unknown> };
+    expect(Object.keys(some.properties)).toEqual(["apis", "followup"]);
   });
 });

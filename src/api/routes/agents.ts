@@ -15,7 +15,7 @@ import {
   listInboxes,
   setInboxWebhook,
 } from "../../makecrm/client.js";
-import { parseSpec, type AgentSpec } from "../../spec/agent.js";
+import { parseSpec, specSchema, type AgentSpec } from "../../spec/agent.js";
 import { cleanFilters, conversationIds, historyFilters, historyPage } from "../../makecrm/history.js";
 import { canCompany } from "../auth.js";
 import { webchatTypeId } from "../../webchat/makecrm.js";
@@ -121,6 +121,13 @@ function validation(draft: unknown) {
 }
 
 export async function agentRoutes(app: FastifyInstance) {
+  // O formato do rascunho (JSON Schema), para quem monta o agente com IA.
+  app.get("/v1/spec/schema", async (req) => {
+    const q = req.query as { sections?: string };
+    const sections = (q.sections ?? "").split(",").map((s) => s.trim()).filter(Boolean).slice(0, 30);
+    return { version: "mavi-agent/v1", schema: specSchema(sections) };
+  });
+
   // ---------------------------------------------------------------- agentes
   app.get("/v1/agents", async (req) => {
     const q = req.query as { company_id?: string; mavi_client_id?: string };

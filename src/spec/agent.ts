@@ -212,3 +212,20 @@ export function parseSpec(input: unknown): { ok: true; spec: AgentSpec } | { ok:
     errors: r.error.issues.map((i) => ({ path: i.path.join("."), message: i.message })),
   };
 }
+
+let schemaCache: Record<string, unknown> | null = null;
+/**
+ * O formato do rascunho em JSON Schema (o que entra, com os padrões), para
+ * quem monta o agente com IA (Importar do n8n no MAVI Tasks). `sections`
+ * restringe às partes pedidas (persona, apis, followup…).
+ */
+export function specSchema(sections: string[] = []): Record<string, unknown> {
+  schemaCache ??= z.toJSONSchema(AgentSpec, { io: "input", unrepresentable: "any" }) as Record<string, unknown>;
+  if (!sections.length) return schemaCache;
+  const props = (schemaCache.properties ?? {}) as Record<string, unknown>;
+  return {
+    type: "object",
+    properties: Object.fromEntries(sections.filter((s) => s in props).map((s) => [s, props[s]])),
+    ...(schemaCache.$defs ? { $defs: schemaCache.$defs } : {}),
+  };
+}
