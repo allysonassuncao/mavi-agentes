@@ -70,7 +70,7 @@ export function buildSystemPrompt(spec: AgentSpec): string {
         "Faça no máximo uma pergunta por mensagem e não repita o que o lead acabou de dizer.",
         "Fale sempre em primeira pessoa (\"eu verifiquei\", \"eu agendei\").",
         "Varie as palavras: o roteiro é um guia, não um texto para copiar.",
-        "Se perguntarem diretamente se você é um robô ou uma IA, não negue: diga que é a assistente virtual da empresa.",
+        "Se perguntarem diretamente se você é um robô ou uma IA, siga o que as regras da empresa mandam; se elas não disserem nada, não negue: diga que é a assistente virtual da empresa.",
       ]),
   );
 
@@ -88,7 +88,9 @@ export function buildSystemPrompt(spec: AgentSpec): string {
       "Mídias do conhecimento e das respostas das APIs têm um código (ex.: M2). Para enviar uma, coloque o código em `midias` da mensagem certa na ferramenta responder. Nunca escreva links de mídia no texto.",
     );
   }
-  knowledgeRules.push("Se não encontrar a informação, diga com naturalidade que vai confirmar e siga a conversa; não chute.");
+  knowledgeRules.push(
+    "Se não encontrar a informação, não chute: faça o que as regras e o roteiro da empresa mandam para esse caso (consultar a equipe, passar para uma pessoa, oferecer outra coisa); se não disserem nada, diga com naturalidade que vai confirmar e siga a conversa.",
+  );
   parts.push(`# Conhecimento\n${bullets(knowledgeRules)}`);
 
   const actions = integrationsPrompt(spec);
@@ -145,6 +147,7 @@ export function buildSystemPrompt(spec: AgentSpec): string {
           : []),
         "Se não houver nada a dizer (por exemplo, o lead só agradeceu depois de a conversa terminar), chame responder com `mensagens` vazio e explique em `motivo_silencio`.",
         "Se o lead perguntou algo ou fez uma objeção que estas instruções e o conhecimento não cobrem, registre em `lacunas` (o lead não vê). Responda mesmo assim do melhor jeito, sem inventar dados.",
+        "Quando uma orientação geral deste texto conflitar com as regras, o roteiro ou as instruções adicionais da empresa, vale a da empresa.",
       ]),
   );
 
@@ -202,7 +205,8 @@ export function contextBlock(input: {
     lines.push(`Sua última mensagem para este lead: ${days <= 0 ? "hoje" : days === 1 ? "há 1 dia" : `há ${days} dias`}.`);
   }
   if (input.channel) lines.push(input.channel);
-  const who = [input.contactName && `nome no WhatsApp: ${input.contactName}`, input.phone && `telefone: ${input.phone}`].filter(Boolean);
+  // O nome do perfil do WhatsApp não foi dito pelo lead: o agente decide pelas regras da empresa se usa.
+  const who = [input.contactName && `nome no perfil do WhatsApp (o lead não disse): ${input.contactName}`, input.phone && `telefone: ${input.phone}`].filter(Boolean);
   if (who.length) lines.push(`Contato: ${who.join(", ")}`);
   const facts = Object.entries(input.facts).filter(([, v]) => v !== null && v !== "");
   if (facts.length) lines.push(`Dados já registrados do contato: ${facts.map(([k, v]) => `${k}: ${String(v)}`).join("; ")}`);

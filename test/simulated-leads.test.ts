@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseCompare, parsePersonas, parseVerdict, summarize } from "../src/tests/runner.js";
+import { issueScore, JUDGE_RULES, judgeConfig, parseCompare, parsePersonas, parseVerdict, summarize } from "../src/tests/runner.js";
 
 describe("testes com leads simulados", () => {
   it("perfis: valida, corta e completa", () => {
@@ -30,7 +30,9 @@ describe("testes com leads simulados", () => {
       pontos_fortes: ["Educado"],
       resumo: "Agendou.",
     });
-    expect(v.score).toBe(10);
+    // A nota sai dos problemas (10 − 3 grave − 0,5 leve); a do avaliador fica guardada.
+    expect(v.score).toBe(6.5);
+    expect(v.judge_score).toBe(10);
     expect(v.outcome).toBe("scheduled");
     expect(v.issues).toEqual([
       { type: "wrong_info", severity: 3, detail: "Inventou preço", quote: "R$ 99" },
@@ -82,5 +84,30 @@ describe("reencenar conversas reais", () => {
     ]);
     expect(s.replay).toEqual({ better: 1, same: 1, worse: 1 });
     expect(summarize([{ status: "done", verdict: v }]).replay).toBeUndefined();
+  });
+});
+
+describe("a régua do avaliador", () => {
+  it("a nota pelos problemas: gravidade e objetivo (fim justo não tira)", () => {
+    expect(issueScore([], true, "scheduled")).toBe(10);
+    expect(issueScore([{ severity: 2 }, { severity: 2 }, { severity: 1 }], true, "scheduled")).toBe(6.5);
+    expect(issueScore([], false, "in_progress")).toBe(9);
+    expect(issueScore([], false, "not_interested")).toBe(10);
+    expect(issueScore(Array.from({ length: 6 }, () => ({ severity: 3 })), true, "other")).toBe(0);
+    expect(parseVerdict({ problemas: [{ tipo: "wrong_info", gravidade: 2, detalhe: "x", fonte: "api_estoque: encontrados 0" }] }).issues[0]!.source).toBe("api_estoque: encontrados 0");
+  });
+
+  it("o avaliador vê o roteiro, o estilo, as instruções adicionais e as regras do que é inventado", () => {
+    const spec = {
+      persona: { name: "Luiza", company: "Estoquecar", segment: "", company_summary: "Loja de seminovos", tone: "comercial e objetiva", reply_size: "short", emoji: "few" },
+      instructions: { goal: "Agendar a visita", conversation_guide: "1. Abertura", rules: ["Nunca invente parcela"], never: ["Prometer aprovação"], extra: "# GATE DA VISITA", weekly_hours: null, business_hours: "8h às 18h" },
+      handoff: { enabled: true, when: "Cliente reclamando" },
+      output: { max_messages: 8 },
+    } as never;
+    const c = judgeConfig(spec);
+    for (const t of ["1. Abertura", "# GATE DA VISITA", "Tom: comercial e objetiva", "Nunca invente parcela", "Prometer aprovação", "8h às 18h", "Cliente reclamando"]) expect(c).toContain(t);
+    expect(JUDGE_RULES).toContain("O que veio de uma ferramenta não é inventado");
+    expect(JUDGE_RULES).toContain("nome no perfil do WhatsApp");
+    expect(JUDGE_RULES).toContain("a MAVI responde às consultas à equipe");
   });
 });

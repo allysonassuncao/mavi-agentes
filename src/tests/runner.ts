@@ -7,6 +7,10 @@ import { log } from "../log.js";
 import { parseGaps, recordGaps, type GapDraft } from "../insights/gap-capture.js";
 import { OUTCOMES } from "../insights/analyze.js";
 import { runTurn } from "../runtime/turn.js";
+import { weeklyHoursText } from "../runtime/prompt.js";
+import { acceptAnswer, teamEventText, type TeamQuestionRow } from "../runtime/team.js";
+import { runApiTool } from "../integrations/apis.js";
+import { apiToolName } from "../spec/apis.js";
 import { agentKeys } from "../secrets.js";
 import { parseSpec, type AgentSpec } from "../spec/agent.js";
 
@@ -61,10 +65,13 @@ const profileLabel = (p: Persona) => (p.script ? "Conversa real" : (PROFILES[p.p
 export const TEST_ISSUES = ["wrong_info", "ignored_question", "repetition", "overpromise", "tone", "missed_handoff", "rule_violation", "off_script", "other"] as const;
 
 export type Verdict = {
+  /** A nota pelos problemas (issueScore): a mesma régua em toda bateria. */
   score: number;
+  /** A nota que o avaliador deu de cabeça (só para comparar). */
+  judge_score?: number;
   goal_reached: boolean;
   outcome: string;
-  issues: { type: string; severity: number; detail: string; quote: string }[];
+  issues: { type: string; severity: number; detail: string; quote: string; source?: string }[];
   gaps: GapDraft[];
   strengths: string[];
   summary: string;
@@ -155,8 +162,27 @@ export function parsePersonas(raw: unknown, n: number): Persona[] {
     .slice(0, n);
 }
 
+/** As APIs que parecem catálogo (estoque, produtos, imóveis…): uma amostra do que existe hoje para os leads pedirem. */
+const CATALOG = /estoque|cat[aá]logo|produto|invent[aá]rio|im[oó]ve|ve[ií]culo|card[aá]pio|vitrine/i;
+export async function catalogSample(agentId: string, spec: AgentSpec): Promise<string> {
+  const parts: string[] = [];
+  const apis = (spec.apis ?? []).filter((a) => a.enabled && a.kind === "read" && CATALOG.test(`${a.name} ${a.when}`)).slice(0, 2);
+  for (const api of apis) {
+    const r = await runApiTool(apiToolName(api.id), {}, { agentId, simulation: true, spec, phone: null, contactName: null, facts: {} }).catch(() => null);
+    if (r && r.debug.outcome !== "error" && r.debug.outcome !== "empty") parts.push(`${api.name}:\n${r.result.slice(0, 6000)}`);
+  }
+  const products = await db()<{ title: string }[]>`
+    select title from public.knowledge_items
+    where agent_id = ${agentId} and kind = 'product' and deleted_at is null and training_id is null and title <> ''
+    order by random() limit 40`.catch(() => []);
+  if (products.length) parts.push(`Produtos da base: ${products.map((x) => x.title).join("; ")}`);
+  return parts.join("\n\n").slice(0, 9000);
+}
+
 async function makePersonas(run: RunRow, spec: AgentSpec): Promise<Persona[]> {
   const chosen = run.profiles.filter((p) => PROFILES[p]);
+  // O que existe hoje: a maioria dos leads pede algo real (os outros testam o que não existe).
+  const catalog = await catalogSample(run.agent_id, spec).catch(() => "");
   const r = await chat({
     ...leadModel(run),
     keys: await agentKeys(run.agent_id),
@@ -182,6 +208,9 @@ async function makePersonas(run: RunRow, spec: AgentSpec): Promise<Persona[]> {
           spec.instructions.conversation_guide ? `Roteiro do agente (trecho): ${spec.instructions.conversation_guide.slice(0, 2000)}` : "",
           `Crie ${run.conversations} perfis${chosen.length ? `, distribuídos entre: ${chosen.join(", ")}` : ", escolhendo a melhor mistura para achar falhas"}.`,
           run.focus ? `Foco pedido por quem testa: ${run.focus}` : "",
+          catalog
+            ? `O que a empresa tem hoje (amostra do catálogo):\n${catalog}\n\nEm cerca de 70% dos perfis, o lead quer algo desta lista (fale como um cliente falaria: modelo, ano, cor, faixa de preço). Nos outros, peça algo que não está na lista, para testar como o agente lida com o que não tem.`
+            : "",
         ]
           .filter(Boolean)
           .join("\n\n"),
@@ -228,8 +257,21 @@ async function leadSays(run: RunRow, spec: AgentSpec, p: Persona, history: { rol
 
 // ---------------------------------------------------------------- avaliação
 
+/** Quanto cada problema tira da nota, pela gravidade. */
+export const ISSUE_PENALTY: Record<number, number> = { 1: 0.5, 2: 1.5, 3: 3 };
+/** Fim que não é falha do agente: o lead não era público, desistiu por conta própria ou foi para uma pessoa. */
+const FAIR_END = new Set(["handed_off", "not_interested", "disqualified"]);
+/**
+ * A nota pelos problemas encontrados: começa em 10, cada problema tira pela gravidade e não atingir o
+ * objetivo (sem um fim justo) tira 1. Assim a nota de uma bateria vale contra a de outra.
+ */
+export function issueScore(issues: { severity: number }[], goal: boolean, outcome: string): number {
+  const lost = issues.reduce((n, i) => n + (ISSUE_PENALTY[i.severity] ?? 1), 0) + (goal || FAIR_END.has(outcome) ? 0 : 1);
+  return Math.round(Math.max(0, Math.min(10, 10 - lost)) * 10) / 10;
+}
+
 export function parseVerdict(raw: Record<string, unknown>): Verdict {
-  const score = Math.max(0, Math.min(10, Math.round(Number(raw.nota) || 0)));
+  const judgeScore = Math.max(0, Math.min(10, Math.round(Number(raw.nota) || 0)));
   const outcome = (OUTCOMES as readonly string[]).includes(String(raw.resultado)) ? String(raw.resultado) : "other";
   const issues = (Array.isArray(raw.problemas) ? raw.problemas : [])
     .map((x) => {
@@ -239,13 +281,16 @@ export function parseVerdict(raw: Record<string, unknown>): Verdict {
         severity: Math.max(1, Math.min(3, Math.round(Number(o.gravidade) || 1))),
         detail: clip(o.detalhe, 400),
         quote: clip(o.trecho, 300),
+        ...(clip(o.fonte, 300) ? { source: clip(o.fonte, 300) } : {}),
       };
     })
     .filter((x) => x.detail)
     .slice(0, 8);
+  const goal = raw.objetivo_atingido === true;
   return {
-    score,
-    goal_reached: raw.objetivo_atingido === true,
+    score: issueScore(issues, goal, outcome),
+    judge_score: judgeScore,
+    goal_reached: goal,
     outcome,
     issues,
     gaps: parseGaps(raw.lacunas),
@@ -254,46 +299,159 @@ export function parseVerdict(raw: Record<string, unknown>): Verdict {
   };
 }
 
-async function judge(run: RunRow, spec: AgentSpec, p: Persona, transcript: string, leadText: string, conversationId: string): Promise<Verdict> {
-  const kb = await searchKnowledge({ agentId: run.agent_id, query: leadText.slice(0, 2000), k: 6, trainingId: run.training_id }).catch(() => ({ results: [] }));
+/** Tudo o que o agente tem para seguir (o avaliador mede contra isto, não contra o que imagina). */
+export function judgeConfig(spec: AgentSpec): string {
   const ins = spec.instructions;
+  const p = spec.persona;
+  const hours = [weeklyHoursText(ins.weekly_hours), ins.business_hours.trim()].filter(Boolean).join("\n");
+  return [
+    `# O agente\n${agentBrief(spec)}`,
+    `# Estilo configurado\nTom: ${p.tone}. Tamanho das respostas: ${p.reply_size}. Emojis: ${p.emoji}. Até ${spec.output.max_messages} mensagens por resposta.`,
+    hours ? `# Horários de funcionamento\n${hours}` : "",
+    ins.conversation_guide.trim() ? `# Roteiro (como conduzir a conversa)\n${ins.conversation_guide.trim().slice(0, 25_000)}` : "",
+    ins.rules.length ? `# Regras\n- ${ins.rules.join("\n- ")}` : "",
+    ins.never.length ? `# O agente nunca deve\n- ${ins.never.join("\n- ")}` : "",
+    spec.handoff.enabled ? `# Quando passar para uma pessoa\n${spec.handoff.when || "Quando o lead pedir, houver reclamação séria ou o agente não puder ajudar."}` : "",
+    ins.extra.trim() ? `# Instruções adicionais\n${ins.extra.trim().slice(0, 45_000)}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+/** O que o agente fez numa vez (ferramentas e o que voltou), para o avaliador; e os trechos da base que ele recebeu. */
+export async function turnTrace(turnId: string): Promise<{ lines: string[]; chunks: string[] }> {
+  const [t] = await db()<{ tools: { name: string; args: unknown; result: string }[] | null; retrieved: { chunk_id?: string; title?: string }[] | null }[]>`
+    select tools, retrieved from public.turns where id = ${turnId}`;
+  const lines = (t?.tools ?? [])
+    .filter((x) => x.name !== "responder")
+    .map((x) => `  [ferramenta ${x.name}(${clip(JSON.stringify(x.args ?? {}), 200)}) → ${clip(x.result, 400)}]`);
+  return { lines, chunks: (t?.retrieved ?? []).map((r) => String(r.chunk_id ?? "")).filter(Boolean) };
+}
+
+/** Os trechos da base que o agente recebeu na conversa (o material contra o qual "informação errada" é medida). */
+async function chunksText(ids: string[]): Promise<string[]> {
+  const uniq = [...new Set(ids)].slice(0, 40);
+  if (!uniq.length) return [];
+  const rows = await db()<{ title: string; content: string }[]>`
+    select title, content from public.knowledge_chunks where id = any (${uniq}::uuid[])`.catch(() => []);
+  return rows.map((x) => `- ${x.title ? `${x.title}: ` : ""}${x.content.slice(0, 700)}`);
+}
+
+export const JUDGE_RULES = [
+  "Você avalia uma conversa de teste entre um agente de atendimento no WhatsApp e um lead simulado. Seja exigente e justo, em português.",
+  "Meça contra o que o agente tem para seguir (estilo, roteiro, regras, instruções adicionais) e contra o que ele recebeu: o material da base e o resultado das ferramentas. Não puna o que está de acordo com isso, mesmo que você faria diferente.",
+  "As linhas entre colchetes mostram o que o agente fez e recebeu (o lead não vê): ferramentas chamadas e o que voltou, e as respostas da equipe.",
+  "Informação errada ou promessa indevida só quando contradiz o material, as ferramentas, as instruções ou a conversa, ou quando não aparece em nenhum deles. Em \"fonte\", diga de onde é o certo (ex.: \"api_estoque: encontrados 0\", \"Regras\", \"Base: Política de troca\") ou \"nenhuma fonte\". O que veio de uma ferramenta não é inventado.",
+  "O nome do lead que aparece como nome no perfil do WhatsApp não é inventado; usá-lo só é problema se as regras do agente proibirem (aí é quebrou uma regra).",
+  "Nos testes, a MAVI responde às consultas à equipe como se fosse a equipe; esperar por essa resposta não é falha.",
+  "Aponte: informação errada ou inventada, pergunta sem resposta, repetição, promessa indevida, tom fora do estilo configurado, não passou para a equipe quando devia, quebrou uma regra, saiu do roteiro. Gravidade: 1 leve, 2 atrapalha a conversa, 3 grave (prejudica o lead ou a empresa).",
+  "Lacunas: perguntas ou objeções do lead que o agente não soube responder com base no material (escreva genérico, sem nomes).",
+  'Responda só JSON: {"nota": 0-10, "objetivo_atingido": true|false, "resultado": "scheduled|purchased|qualified|handed_off|in_progress|not_interested|ghosted|disqualified|other",',
+  ' "problemas": [{"tipo": "wrong_info|ignored_question|repetition|overpromise|tone|missed_handoff|rule_violation|off_script|other", "gravidade": 1-3, "detalhe": "...", "trecho": "o que o agente disse", "fonte": "de onde é o certo"}],',
+  ' "lacunas": [{"tipo": "pergunta|objecao", "texto": "..."}], "pontos_fortes": ["..."], "resumo": "uma frase"}',
+].join("\n");
+
+async function judge(
+  run: RunRow,
+  spec: AgentSpec,
+  p: Persona,
+  transcript: string,
+  leadText: string,
+  conversationId: string,
+  chunkIds: string[] = [],
+): Promise<Verdict> {
+  // O material: o que o agente recebeu em cada vez e, por garantia, uma busca pelo assunto do lead.
+  const [seen, kb] = await Promise.all([
+    chunksText(chunkIds),
+    searchKnowledge({ agentId: run.agent_id, query: leadText.slice(0, 2000), k: 6, trainingId: run.training_id }).catch(() => ({ results: [] })),
+  ]);
+  const material = [...seen, ...kb.results.map((x) => `- ${x.title ? `${x.title}: ` : ""}${x.content.slice(0, 700)}`)].filter((x, i, a) => a.indexOf(x) === i);
   const r = await chat({
     ...judgeModel(run, config().DEFAULT_MODEL),
     keys: await agentKeys(run.agent_id),
     json: true,
+    effort: "medium",
+    maxTokens: 5000,
+    timeoutMs: 180_000,
+    messages: [
+      // O que é igual em toda a bateria fica no começo (o provedor reaproveita o cache).
+      { role: "system", content: `${JUDGE_RULES}\n\n${judgeConfig(spec)}` },
+      {
+        role: "user",
+        content: [
+          material.length ? `Material do agente (trechos da base que ele recebeu ou que tratam do assunto):\n${material.join("\n").slice(0, 20_000)}` : "Material do agente: (nada encontrado sobre o assunto)",
+          `Lead simulado (${PROFILES[p.perfil]?.label ?? p.perfil}): ${p.descricao} Objetivo: ${p.objetivo}`,
+          `Nome no perfil do WhatsApp do lead: ${p.nome}`,
+          `Conversa:\n${transcript.slice(-40_000)}`,
+        ].join("\n\n"),
+      },
+    ],
+  });
+  await recordCost({ agentId: run.agent_id, conversationId, source: "test_judge", simulation: true, usage: r.usage, model: r.model, meta: { test_run: run.id } });
+  return parseVerdict(json(r.message.content));
+}
+
+// ---------------------------------------------------------------- a equipe nos testes
+/** A MAVI responde como a equipe: com o que estiver na base; sem a informação, diz que não tem. */
+async function teamAnswer(run: RunRow, spec: AgentSpec, q: Pick<TeamQuestionRow, "question" | "context">, conversationId: string): Promise<string> {
+  const kb = await searchKnowledge({ agentId: run.agent_id, query: q.question, k: 6, trainingId: run.training_id }).catch(() => ({ results: [] }));
+  const r = await chat({
+    ...leadModel(run),
+    keys: await agentKeys(run.agent_id),
     effort: "low",
-    maxTokens: 4000,
-    timeoutMs: 120_000,
+    maxTokens: 600,
+    timeoutMs: 60_000,
     messages: [
       {
         role: "system",
         content: [
-          "Você avalia uma conversa de teste entre um agente de atendimento no WhatsApp e um lead simulado. Seja exigente e justo, em português.",
-          "Aponte: informação errada ou inventada (compare com o material), pergunta sem resposta, repetição, promessa indevida, tom inadequado, não passou para a equipe quando devia, quebrou uma regra, saiu do roteiro.",
-          "Lacunas: perguntas ou objeções do lead que o agente não soube responder com base no material (escreva genérico, sem nomes).",
-          'Responda só JSON: {"nota": 0-10, "objetivo_atingido": true|false, "resultado": "scheduled|purchased|qualified|handed_off|in_progress|not_interested|ghosted|disqualified|other",',
-          ' "problemas": [{"tipo": "wrong_info|ignored_question|repetition|overpromise|tone|missed_handoff|rule_violation|off_script|other", "gravidade": 1-3, "detalhe": "...", "trecho": "o que o agente disse"}],',
-          ' "lacunas": [{"tipo": "pergunta|objecao", "texto": "..."}], "pontos_fortes": ["..."], "resumo": "uma frase"}',
+          `Você é da equipe de ${spec.persona.company} e responde, pelo WhatsApp interno, uma dúvida que o atendimento (um agente de IA) recebeu de um lead.`,
+          "Responda curto e direto, só com o que está no material abaixo ou no resumo da empresa. Se não estiver, responda exatamente: Não temos essa informação.",
+          "Não invente preço, prazo, política nem disponibilidade.",
         ].join("\n"),
       },
       {
         role: "user",
         content: [
           agentBrief(spec),
-          ins.rules.length ? `Regras do agente:\n- ${ins.rules.join("\n- ")}` : "",
-          ins.never.length ? `O agente nunca deve:\n- ${ins.never.join("\n- ")}` : "",
-          spec.handoff.enabled && spec.handoff.when ? `Quando passar para uma pessoa: ${spec.handoff.when}` : "",
-          kb.results.length ? `Material do agente (trechos):\n${kb.results.map((x) => `- ${x.title ? `${x.title}: ` : ""}${x.content.slice(0, 600)}`).join("\n")}` : "Material do agente: (nada encontrado sobre o assunto)",
-          `Lead simulado (${PROFILES[p.perfil]?.label ?? p.perfil}): ${p.descricao} Objetivo: ${p.objetivo}`,
-          `Conversa:\n${transcript.slice(-20_000)}`,
-        ]
-          .filter(Boolean)
-          .join("\n\n"),
+          kb.results.length ? `Material:\n${kb.results.map((x) => `- ${x.title ? `${x.title}: ` : ""}${x.content.slice(0, 700)}`).join("\n")}` : "Material: (nada sobre o assunto)",
+          `Dúvida: ${q.question}${q.context ? `\nContexto: ${q.context}` : ""}`,
+        ].join("\n\n"),
       },
     ],
   });
-  await recordCost({ agentId: run.agent_id, conversationId, source: "test_judge", simulation: true, usage: r.usage, model: r.model, meta: { test_run: run.id } });
-  return parseVerdict(json(r.message.content));
+  // Conta com o lado simulado (o lead), marcado como a equipe.
+  await recordCost({ agentId: run.agent_id, conversationId, source: "test_lead", simulation: true, usage: r.usage, model: r.model, meta: { test_run: run.id, role: "team" } });
+  return clip(r.message.content, 1500) || "Não temos essa informação.";
+}
+
+/**
+ * As consultas à equipe das vezes anteriores ganham resposta (a da vez de agora espera a próxima, como
+ * no dia a dia) e o agente responde ao lead com ela, numa vez própria. Não vira item da base.
+ */
+async function deliverTeamAnswers(run: RunRow, spec: AgentSpec, conversationId: string, currentTurn: string | null) {
+  const sql = db();
+  const open = await sql<TeamQuestionRow[]>`
+    select * from public.team_questions where conversation_id = ${conversationId} and simulation and status = 'open'
+      and turn_id is distinct from ${currentTurn} order by asked_at`;
+  const out: { question: string; answer: string; reply: string; turnId: string | null }[] = [];
+  for (const q of open) {
+    const answer = await teamAnswer(run, spec, q, conversationId);
+    if (!(await acceptAnswer({ ...q, learn: false }, answer, "equipe (simulada pela MAVI)", "panel", null))) continue;
+    const r = await runTurn({
+      conversationId,
+      spec,
+      agentVersion: run.agent_version,
+      event: {
+        text: teamEventText({ question: q.question, answer, answered_by: "a equipe" }, "answer"),
+        note: `Consulta à equipe #${q.code}: a equipe (simulada pela MAVI) respondeu "${answer}"`,
+        query: q.question,
+      },
+    });
+    await sql`update public.team_questions set delivered_at = now(), delivered_turn_id = ${r.turnId}, outcome = 'teste: resposta simulada entregue', updated_at = now() where id = ${q.id}`;
+    out.push({ question: q.question, answer, reply: r.messages.map((m) => m.text).join("\n"), turnId: r.turnId });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------- a bateria
@@ -392,6 +550,7 @@ export async function runConversation(runId: string, idx: number): Promise<strin
     // Visto do lado do lead: o que o agente diz é "user", o que o lead diz é "assistant".
     const leadHistory: { role: "user" | "assistant"; content: string }[] = [];
     const lines: string[] = [];
+    const chunkIds: string[] = [];
     let turns = 0;
     let gaps: GapDraft[] = [];
     for (let t = 0; t < run.max_turns; t++) {
@@ -413,8 +572,25 @@ export async function runConversation(runId: string, idx: number): Promise<strin
       if (r.turnId) {
         const [tr] = await sql<{ output: { gaps?: unknown } | null }[]>`select output from public.turns where id = ${r.turnId}`;
         gaps = gaps.concat(parseGaps(tr?.output?.gaps));
+        // O que o agente fez nesta vez (o avaliador vê; o lead não).
+        const trace = await turnTrace(r.turnId);
+        lines.push(...trace.lines);
+        chunkIds.push(...trace.chunks);
       }
       if (said.end || r.handoff) break;
+      // A equipe (simulada pela MAVI) responde às consultas das vezes anteriores.
+      for (const t of await deliverTeamAnswers(run, spec, conversationId, r.turnId ?? null)) {
+        lines.push(`  [a equipe respondeu à consulta "${clip(t.question, 200)}": "${clip(t.answer, 400)}"]`);
+        if (t.reply) {
+          lines.push(`Agente: ${t.reply}`);
+          leadHistory.push({ role: "user", content: t.reply });
+        }
+        if (t.turnId) {
+          const trace = await turnTrace(t.turnId);
+          lines.push(...trace.lines);
+          chunkIds.push(...trace.chunks);
+        }
+      }
       if ((await runCost(runId)) >= cap) {
         await stopRun(runId, "teto de custo da bateria");
         break;
@@ -424,7 +600,7 @@ export async function runConversation(runId: string, idx: number): Promise<strin
     }
     const transcript = lines.join("\n");
     const leadText = lines.filter((l) => l.startsWith("Lead:")).join("\n");
-    const verdict = turns ? await judge(run, spec, p, transcript, leadText, conversationId) : null;
+    const verdict = turns ? await judge(run, spec, p, transcript, leadText, conversationId, chunkIds) : null;
     // Lacunas: o que o agente avisou + o que o avaliador viu (sem repetir).
     const all = [...gaps, ...(verdict?.gaps ?? [])].filter((g, i, a) => a.findIndex((x) => x.text.toLowerCase() === g.text.toLowerCase()) === i);
     if (all.length) await recordGaps({ agentId: run.agent_id, conversationId, turnId: null, leadText: leadText.slice(0, 1000), gaps: all, origin: "test" });

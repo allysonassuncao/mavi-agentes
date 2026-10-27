@@ -78,3 +78,15 @@ describe("o formato do rascunho em JSON Schema", () => {
     expect(Object.keys(some.properties)).toEqual(["apis", "followup"]);
   });
 });
+
+describe("regras da empresa acima das gerais", () => {
+  it("as orientações gerais cedem às regras da empresa e o nome do WhatsApp vem marcado", () => {
+    const r = parseSpec(minimal);
+    if (!r.ok) throw new Error("spec");
+    const p = buildSystemPrompt(r.spec);
+    expect(p).toContain("vale a da empresa");
+    expect(p).toContain("siga o que as regras da empresa mandam; se elas não disserem nada, não negue");
+    expect(p).toContain("faça o que as regras e o roteiro da empresa mandam para esse caso");
+    expect(contextBlock({ contactName: "Jéssica", facts: {}, summary: "", retrieved: [] })).toContain("nome no perfil do WhatsApp (o lead não disse): Jéssica");
+  });
+});
