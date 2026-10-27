@@ -2,7 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { db } from "../../db.js";
 import { scheduleTestRun } from "../../queue.js";
-import { parseSpec } from "../../spec/agent.js";
+import { parseSpec, type AgentSpec } from "../../spec/agent.js";
 import { PROFILES, stopRun } from "../../tests/runner.js";
 import { assertUuid, HttpError, notFound, parseBody } from "../http.js";
 import { loadAgent, ModelDefaults, withModelDefaults } from "./agents.js";
@@ -59,7 +59,8 @@ const Start = z.object({
   spec: z.unknown().optional(),
   personas: z.array(TrainingPersona).max(50).default([]),
   training_id: z.string().trim().min(1).max(64).optional(),
-  models: z.object({ lead: RunModel, judge: RunModel }).partial().optional(),
+  /** Os modelos da bateria: o agente testado (só no teste), o lead simulado e o avaliador. Ficam em test_runs.models. */
+  models: z.object({ agent: RunModel, lead: RunModel, judge: RunModel }).partial().optional(),
   /** kind "replay": as conversas reais, uma por conversa da bateria. */
   scripts: z.array(Script).max(30).default([]),
   use: z.union([z.literal("draft"), z.literal("published"), z.number().int().min(1)]).default("draft"),
@@ -81,6 +82,11 @@ export async function testRoutes(app: FastifyInstance) {
     const body = parseBody(Start, req.body);
     const profiles = body.profiles.filter((p) => PROFILES[p]);
     const sql = db();
+    // Outro modelo para o agente testado (Leads simulados); o antes de publicar compara sempre com o modelo do próprio agente.
+    const agentModel = (spec: AgentSpec): AgentSpec =>
+      body.kind === "publish" || !body.models?.agent
+        ? spec
+        : { ...spec, model: { ...spec.model, model: body.models.agent.ref, pricing: body.models.agent.pricing ?? spec.model.pricing } };
     const specOf = async (use: "draft" | "published" | number) => {
       if (body.spec !== undefined) {
         const r = parseSpec(body.spec);
@@ -90,18 +96,19 @@ export async function testRoutes(app: FastifyInstance) {
       if (use === "draft") {
         const r = parseSpec(a.draft);
         if (!r.ok) throw new HttpError(422, "O rascunho tem campos inválidos: corrija antes de testar.", r.errors);
-        return { spec: withModelDefaults(r.spec, body), version: null as number | null };
+        return { spec: agentModel(withModelDefaults(r.spec, body)), version: null as number | null };
       }
       const version = use === "published" ? a.published_version : use;
       if (!version) throw new HttpError(400, "O agente ainda não tem versão publicada.");
       const [v] = await sql<{ spec: unknown }[]>`select spec from public.agent_versions where agent_id = ${a.id} and version = ${version}`;
       const r = parseSpec(v?.spec);
       if (!r.ok) throw notFound("Versão");
-      return { spec: r.spec, version };
+      return { spec: agentModel(r.spec), version };
     };
     if (body.kind === "replay" && !body.scripts.length) throw new HttpError(400, "Mande as conversas para reencenar.");
-    if (body.kind === "training" && (!body.personas.length || !body.training_id || body.spec === undefined))
-      throw new HttpError(400, "O treino manda a cópia do rascunho, as conversas e o id do treino.");
+    // As conversas prontas (reais, casos) podem faltar: o que faltar para "conversations" vira lead simulado.
+    if (body.kind === "training" && (!body.training_id || body.spec === undefined))
+      throw new HttpError(400, "O treino manda a cópia do rascunho e o id do treino.");
     const personas: unknown[] =
       body.kind === "training"
         ? body.personas
@@ -121,7 +128,7 @@ export async function testRoutes(app: FastifyInstance) {
         : [];
     const insert = async (use: "draft" | "published" | number, compareTo: string | null) => {
       const s = await specOf(use);
-      const conversations = personas.length || body.conversations;
+      const conversations = body.kind === "training" ? Math.max(personas.length, body.conversations) : personas.length || body.conversations;
       const scripted = personas.map((x) => ((x as { script?: unknown[] }).script ?? []).length);
       const maxTurns = body.kind === "replay" ? Math.min(20, Math.max(2, ...scripted)) : body.kind === "training" ? Math.min(20, Math.max(body.max_turns, ...scripted)) : body.max_turns;
       const [row] = await sql<{ id: string }[]>`
@@ -150,7 +157,8 @@ export async function testRoutes(app: FastifyInstance) {
     const a = await loadAgent(req, (req.params as { id: string }).id);
     const q = req.query as { limit?: string };
     const runs = await db()`
-      select r.id, r.kind, r.agent_version, r.compare_to, r.profiles, r.focus, r.conversations, r.max_turns, r.cost_cap_usd::float8 as cost_cap_usd,
+      select r.id, r.kind, r.agent_version, r.compare_to, r.profiles, r.focus, r.conversations, r.max_turns, r.cost_cap_usd::float8 as cost_cap_usd, r.models,
+             r.spec -> 'model' ->> 'model' as agent_model,
              r.cost_usd::float8 as cost_usd, r.status, r.stop_reason, r.summary, r.error, r.created_by, r.created_at, r.started_at, r.finished_at,
              (select count(*) from public.test_conversations c where c.run_id = r.id and c.status not in ('queued', 'running'))::int as finished
       from public.test_runs r where r.agent_id = ${a.id} and r.training_id is null
@@ -170,7 +178,8 @@ export async function testRoutes(app: FastifyInstance) {
     const a = await loadAgent(req, id);
     assertUuid(rid, "Bateria");
     const [run] = await db()`
-      select id, kind, agent_version, compare_to, profiles, focus, personas, conversations, max_turns, cost_cap_usd::float8 as cost_cap_usd,
+      select id, kind, agent_version, compare_to, profiles, focus, personas, conversations, max_turns, cost_cap_usd::float8 as cost_cap_usd, models,
+             spec -> 'model' ->> 'model' as agent_model,
              cost_usd::float8 as cost_usd, status, stop_reason, summary, error, created_by, created_at, started_at, finished_at
       from public.test_runs where id = ${rid} and agent_id = ${a.id}`;
     if (!run) throw notFound("Bateria");

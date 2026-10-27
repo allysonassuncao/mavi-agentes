@@ -305,7 +305,9 @@ export async function startRun(runId: string, enqueue: (runId: string, idx: numb
   if (!run || run.status !== "queued") return;
   await sql`update public.test_runs set status = 'running', started_at = now() where id in (${run.id}, ${run.compare_to ?? run.id}) and status = 'queued'`;
   try {
-    const personas = run.personas.length ? run.personas : await makePersonas(run, specOf(run));
+    // Sem perfis, a MAVI cria todos; no treino, os que faltam (os leads simulados ao lado das conversas reais).
+    const missing = run.conversations - run.personas.length;
+    const personas = missing > 0 ? [...run.personas, ...(await makePersonas({ ...run, conversations: missing }, specOf(run)))] : run.personas;
     const ids = [run.id, ...(run.compare_to ? [run.compare_to] : [])];
     for (const id of ids) {
       await sql`update public.test_runs set personas = ${sql.json(personas as never)}, conversations = ${personas.length} where id = ${id}`;

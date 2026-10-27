@@ -10,7 +10,7 @@ import { parseSpec, type AgentSpec } from "../../spec/agent.js";
 import { assertUuid, HttpError, notFound, parseBody } from "../http.js";
 import { canCompany } from "../auth.js";
 import { advanceSim, simSchedule } from "../../runtime/sim-time.js";
-import { loadAgent, ModelDefaults, withModelDefaults } from "./agents.js";
+import { loadAgent, ModelDefaults, ModelOverride, withModelDefaults, withModelOverride } from "./agents.js";
 
 /** A trava por conversa do worker (worker.ts): uma coisa por vez na conversa. */
 const convLockKey = (id: string) => `conv:lock:${id}`;
@@ -42,6 +42,8 @@ const Simulate = z.object({
     .optional(),
   /** O padrão do Painel da MAVI para o rascunho (a versão publicada já vem com o dela). */
   ...ModelDefaults,
+  /** Outro modelo só neste teste (o Testar deixa trocar por conversa; cada resposta guarda o modelo em turns.model). */
+  ...ModelOverride,
 });
 
 export async function simulateRoutes(app: FastifyInstance) {
@@ -64,6 +66,7 @@ export async function simulateRoutes(app: FastifyInstance) {
       if (!r.ok) throw notFound("Versão");
       spec = r.spec;
     }
+    spec = withModelOverride(spec, body.model_override, body.pricing);
 
     const sql = db();
     // Nova conversa: o teste anterior fica salvo (encerrado, com outro código) e este começa do zero.
@@ -128,15 +131,16 @@ export async function simulateRoutes(app: FastifyInstance) {
     const { id, session } = req.params as { id: string; session: string };
     const a = await loadAgent(req, id);
     const messages = await db()`
-      select m.id, m.role, m.content, m.content_type, m.media, m.turn_id, m.created_at
+      select m.id, m.role, m.content, m.content_type, m.media, m.turn_id, m.created_at, t.model
       from public.messages m join public.conversations c on c.id = m.conversation_id
+      left join public.turns t on t.id = m.turn_id
       where c.agent_id = ${a.id} and c.simulation and c.external_id = ${session}
       order by m.id limit 500`;
     return { messages };
   });
 
   // ---------------------------------------------------------------- avançar o tempo (Testar)
-  const SimUse = z.object({ use: z.union([z.literal("draft"), z.literal("published"), z.number().int().min(1)]).default("draft"), ...ModelDefaults });
+  const SimUse = z.object({ use: z.union([z.literal("draft"), z.literal("published"), z.number().int().min(1)]).default("draft"), ...ModelDefaults, ...ModelOverride });
   /** A especificação do teste (rascunho ou versão) e a conversa de teste pela sessão. */
   async function simContext(a: Awaited<ReturnType<typeof loadAgent>>, session: string, body: z.infer<typeof SimUse>) {
     let spec: AgentSpec;
@@ -153,6 +157,7 @@ export async function simulateRoutes(app: FastifyInstance) {
       if (!r.ok) throw notFound("Versão");
       spec = r.spec;
     }
+    spec = withModelOverride(spec, body.model_override, body.pricing);
     const [conv] = await db()<(ConversationRow & Record<string, unknown>)[]>`
       select * from public.conversations where agent_id = ${a.id} and simulation and external_id = ${session}`;
     return { spec, version, conv: conv ?? null };
@@ -366,8 +371,9 @@ export async function simulateRoutes(app: FastifyInstance) {
     const [c] = await db()<{ id: string }[]>`select id from public.conversations where id = ${cid} and agent_id = ${a.id}`;
     if (!c) throw notFound("Conversa");
     const messages = await db()`
-      select id, role, content, content_type, media, turn_id, created_at from public.messages
-      where conversation_id = ${cid} order by id desc limit 300`;
+      select m.id, m.role, m.content, m.content_type, m.media, m.turn_id, m.created_at, t.model from public.messages m
+      left join public.turns t on t.id = m.turn_id
+      where m.conversation_id = ${cid} order by m.id desc limit 300`;
     return { messages: messages.reverse() };
   });
 }

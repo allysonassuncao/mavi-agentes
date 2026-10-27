@@ -90,6 +90,16 @@ const Publish = z.object({
   ...ModelDefaults,
 });
 
+/**
+ * Testar com outro modelo (Testar e Leads simulados): "<provedor>:<modelo>" no
+ * lugar do modelo do agente, com o preço de quem constrói. Só vale no teste.
+ */
+export const ModelOverride = { model_override: z.string().trim().min(1).max(160).optional() };
+export function withModelOverride(spec: AgentSpec, ref: string | undefined, pricing?: Record<string, z.infer<typeof PricingIn>>): AgentSpec {
+  if (!ref) return spec;
+  return { ...spec, model: { ...spec.model, model: ref, pricing: pricing?.[ref] ?? null } };
+}
+
 /** Completa a versão com o padrão e os preços vindos de quem constrói. */
 export function withModelDefaults(
   spec: AgentSpec,
