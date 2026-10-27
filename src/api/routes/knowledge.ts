@@ -13,7 +13,7 @@ import { loadAgent } from "./agents.js";
 const Kind = z.enum(["faq", "product", "document", "media", "example", "text"]);
 
 /** Item enviado como JSON (texto, FAQ, produto, mídia por link, página por URL). */
-const NewItem = z
+export const NewItem = z
   .object({
     kind: Kind,
     title: z.string().trim().max(300).default(""),
@@ -47,11 +47,11 @@ async function loadItem(req: FastifyRequest, id: string) {
   return it;
 }
 
-async function insertItem(agentId: string, v: z.infer<typeof NewItem>, createdBy: string) {
+export async function insertItem(agentId: string, v: z.infer<typeof NewItem>, createdBy: string, trainingId: string | null = null) {
   const source = v.url ? { type: "url", url: v.url } : { type: "text" };
   const [row] = await db()<{ id: string }[]>`
-    insert into public.knowledge_items (agent_id, kind, title, body, data, source, created_by)
-    values (${agentId}, ${v.kind}, ${v.title}, ${v.body}, ${db().json(v.data as never)}, ${db().json(source as never)}, ${v.created_by ?? createdBy})
+    insert into public.knowledge_items (agent_id, kind, title, body, data, source, created_by, training_id)
+    values (${agentId}, ${v.kind}, ${v.title}, ${v.body}, ${db().json(v.data as never)}, ${db().json(source as never)}, ${v.created_by ?? createdBy}, ${trainingId})
     returning id`;
   await scheduleIngest(row!.id);
   return row!.id;
@@ -66,7 +66,7 @@ export async function knowledgeRoutes(app: FastifyInstance) {
     const offset = Math.max(Number(q.offset) || 0, 0);
     const items = await db().unsafe(
       `select ${ITEM_COLUMNS} from public.knowledge_items
-       where agent_id = $1 and deleted_at is null and ($2::text is null or kind = $2)
+       where agent_id = $1 and deleted_at is null and training_id is null and ($2::text is null or kind = $2)
        order by kind, title, created_at limit $3 offset $4`,
       [a.id, kind, limit, offset],
     );
@@ -76,7 +76,7 @@ export async function knowledgeRoutes(app: FastifyInstance) {
              count(*) filter (where status = 'error')::int as errors,
              count(*) filter (where status in ('pending', 'processing'))::int as processing,
              coalesce(sum(chunk_count), 0)::int as chunks
-      from public.knowledge_items where agent_id = ${a.id} and deleted_at is null`;
+      from public.knowledge_items where agent_id = ${a.id} and deleted_at is null and training_id is null`;
     return { items, totals };
   });
 

@@ -26,8 +26,40 @@ const Script = z.object({
     .max(20),
 });
 
+/** Um modelo escolhido no treino ("<provedor>:<modelo>") e o preço dele. */
+const RunModel = z
+  .object({
+    ref: z.string().trim().min(1).max(160),
+    pricing: z.object({ input: z.number().min(0).max(1000), output: z.number().min(0).max(1000), cached: z.number().min(0).max(1000).nullable().optional() }).nullable().default(null),
+  })
+  .nullable()
+  .default(null);
+/** Uma conversa do treino: um lead simulado (perfil) ou uma conversa real reencenada (script). */
+const TrainingPersona = z
+  .object({
+    nome: z.string().trim().min(1).max(80),
+    perfil: z.string().max(40).default("treino"),
+    descricao: z.string().max(1000).default(""),
+    objetivo: z.string().max(600).default(""),
+    conhece: z.string().max(600).default(""),
+    objecoes: z.array(z.string().max(300)).max(10).default([]),
+    estilo: z.string().max(300).default(""),
+    fim_quando: z.string().max(300).default(""),
+    fonte: z.string().max(200).optional(),
+    script: z
+      .array(z.object({ lead: z.array(z.string().max(4000)).min(1).max(20), original: z.array(z.string().max(4000)).max(20).default([]) }))
+      .max(20)
+      .optional(),
+  })
+  .strict();
+
 const Start = z.object({
-  kind: z.enum(["manual", "publish", "scheduled", "replay"]).default("manual"),
+  kind: z.enum(["manual", "publish", "scheduled", "replay", "training"]).default("manual"),
+  /** kind "training": a cópia do rascunho que esta rodada testa, as conversas (as mesmas a cada rodada) e os modelos. */
+  spec: z.unknown().optional(),
+  personas: z.array(TrainingPersona).max(50).default([]),
+  training_id: z.string().trim().min(1).max(64).optional(),
+  models: z.object({ lead: RunModel, judge: RunModel }).partial().optional(),
   /** kind "replay": as conversas reais, uma por conversa da bateria. */
   scripts: z.array(Script).max(30).default([]),
   use: z.union([z.literal("draft"), z.literal("published"), z.number().int().min(1)]).default("draft"),
@@ -50,6 +82,11 @@ export async function testRoutes(app: FastifyInstance) {
     const profiles = body.profiles.filter((p) => PROFILES[p]);
     const sql = db();
     const specOf = async (use: "draft" | "published" | number) => {
+      if (body.spec !== undefined) {
+        const r = parseSpec(body.spec);
+        if (!r.ok) throw new HttpError(422, "A cópia do rascunho tem campos inválidos.", r.errors);
+        return { spec: withModelDefaults(r.spec, body), version: null as number | null };
+      }
       if (use === "draft") {
         const r = parseSpec(a.draft);
         if (!r.ok) throw new HttpError(422, "O rascunho tem campos inválidos: corrija antes de testar.", r.errors);
@@ -63,8 +100,12 @@ export async function testRoutes(app: FastifyInstance) {
       return { spec: r.spec, version };
     };
     if (body.kind === "replay" && !body.scripts.length) throw new HttpError(400, "Mande as conversas para reencenar.");
-    const personas =
-      body.kind === "replay"
+    if (body.kind === "training" && (!body.personas.length || !body.training_id || body.spec === undefined))
+      throw new HttpError(400, "O treino manda a cópia do rascunho, as conversas e o id do treino.");
+    const personas: unknown[] =
+      body.kind === "training"
+        ? body.personas
+        : body.kind === "replay"
         ? body.scripts.map((x) => ({
             nome: x.nome,
             perfil: "replay",
@@ -81,11 +122,14 @@ export async function testRoutes(app: FastifyInstance) {
     const insert = async (use: "draft" | "published" | number, compareTo: string | null) => {
       const s = await specOf(use);
       const conversations = personas.length || body.conversations;
-      const maxTurns = personas.length ? Math.min(20, Math.max(2, ...personas.map((x) => x.script.length))) : body.max_turns;
+      const scripted = personas.map((x) => ((x as { script?: unknown[] }).script ?? []).length);
+      const maxTurns = body.kind === "replay" ? Math.min(20, Math.max(2, ...scripted)) : body.kind === "training" ? Math.min(20, Math.max(body.max_turns, ...scripted)) : body.max_turns;
       const [row] = await sql<{ id: string }[]>`
-        insert into public.test_runs (agent_id, kind, agent_version, spec, compare_to, profiles, focus, personas, conversations, max_turns, cost_cap_usd, created_by)
+        insert into public.test_runs (agent_id, kind, agent_version, spec, compare_to, profiles, focus, personas, conversations, max_turns, cost_cap_usd, created_by,
+                                      training_id, models)
         values (${a.id}, ${body.kind}, ${s.version}, ${sql.json(s.spec as never)}, ${compareTo}, ${profiles}, ${body.focus}, ${sql.json(personas as never)},
-                ${conversations}, ${maxTurns}, ${body.cost_cap_usd}, ${body.created_by ?? req.client!.name})
+                ${conversations}, ${maxTurns}, ${body.cost_cap_usd}, ${body.created_by ?? req.client!.name},
+                ${body.training_id ?? null}, ${body.models ? sql.json(body.models as never) : null})
         returning id`;
       return row!.id;
     };
@@ -109,7 +153,7 @@ export async function testRoutes(app: FastifyInstance) {
       select r.id, r.kind, r.agent_version, r.compare_to, r.profiles, r.focus, r.conversations, r.max_turns, r.cost_cap_usd::float8 as cost_cap_usd,
              r.cost_usd::float8 as cost_usd, r.status, r.stop_reason, r.summary, r.error, r.created_by, r.created_at, r.started_at, r.finished_at,
              (select count(*) from public.test_conversations c where c.run_id = r.id and c.status not in ('queued', 'running'))::int as finished
-      from public.test_runs r where r.agent_id = ${a.id}
+      from public.test_runs r where r.agent_id = ${a.id} and r.training_id is null
       order by r.created_at desc limit ${Math.min(Number(q.limit) || 20, 100)}`;
     // O que os testes gastaram no mês (para o teto mensal de quem chama).
     const [month] = await db()<{ c: number }[]>`

@@ -84,7 +84,13 @@ type RunRow = {
   max_turns: number;
   cost_cap_usd: string;
   status: string;
+  training_id?: string | null;
+  models?: { lead?: RunModel | null; judge?: RunModel | null } | null;
 };
+type RunModel = { ref: string; pricing?: { input: number; output: number; cached?: number | null } | null };
+/** O modelo do lead simulado e do avaliador: o escolhido no treino ou o do motor. */
+const leadModel = (run: RunRow) => ({ model: run.models?.lead?.ref || config().UTILITY_MODEL, pricing: run.models?.lead?.pricing ?? null });
+const judgeModel = (run: RunRow, fallback: string) => ({ model: run.models?.judge?.ref || fallback, pricing: run.models?.judge?.pricing ?? null });
 
 const clip = (v: unknown, max: number) => String(v ?? "").replace(/\s+/g, " ").trim().slice(0, max);
 const json = (text: string | null) => {
@@ -152,7 +158,7 @@ export function parsePersonas(raw: unknown, n: number): Persona[] {
 async function makePersonas(run: RunRow, spec: AgentSpec): Promise<Persona[]> {
   const chosen = run.profiles.filter((p) => PROFILES[p]);
   const r = await chat({
-    model: config().UTILITY_MODEL,
+    ...leadModel(run),
     keys: await agentKeys(run.agent_id),
     json: true,
     effort: "low",
@@ -213,7 +219,7 @@ async function leadSays(run: RunRow, spec: AgentSpec, p: Persona, history: { rol
       ? history.map((h) => ({ role: h.role, content: h.content }) as ChatMessage)
       : [{ role: "user", content: "(Comece a conversa: a sua primeira mensagem para a empresa.)" } as ChatMessage]),
   ];
-  const r = await chat({ model: config().UTILITY_MODEL, keys: await agentKeys(run.agent_id), json: true, effort: "low", maxTokens: 1500, timeoutMs: 60_000, messages });
+  const r = await chat({ ...leadModel(run), keys: await agentKeys(run.agent_id), json: true, effort: "low", maxTokens: 1500, timeoutMs: 60_000, messages });
   await recordCost({ agentId: run.agent_id, conversationId, source: "test_lead", simulation: true, usage: r.usage, model: r.model, meta: { test_run: run.id } });
   const j = json(r.message.content);
   const texts = (Array.isArray(j.mensagens) ? j.mensagens : []).map((x) => clip(x, 600)).filter(Boolean).slice(0, 2);
@@ -249,10 +255,10 @@ export function parseVerdict(raw: Record<string, unknown>): Verdict {
 }
 
 async function judge(run: RunRow, spec: AgentSpec, p: Persona, transcript: string, leadText: string, conversationId: string): Promise<Verdict> {
-  const kb = await searchKnowledge({ agentId: run.agent_id, query: leadText.slice(0, 2000), k: 6 }).catch(() => ({ results: [] }));
+  const kb = await searchKnowledge({ agentId: run.agent_id, query: leadText.slice(0, 2000), k: 6, trainingId: run.training_id }).catch(() => ({ results: [] }));
   const ins = spec.instructions;
   const r = await chat({
-    model: config().DEFAULT_MODEL,
+    ...judgeModel(run, config().DEFAULT_MODEL),
     keys: await agentKeys(run.agent_id),
     json: true,
     effort: "low",
@@ -339,8 +345,8 @@ export async function runConversation(runId: string, idx: number): Promise<strin
   try {
     const [agent] = await sql<{ company_id: string }[]>`select company_id from public.agents where id = ${run.agent_id}`;
     const [conv] = await sql<{ id: string }[]>`
-      insert into public.conversations (agent_id, company_id, external_id, simulation, contact_name, phone)
-      values (${run.agent_id}, ${agent!.company_id}, ${`test:${runId}:${idx}`}, true, ${p.nome}, '5500000000000')
+      insert into public.conversations (agent_id, company_id, external_id, simulation, contact_name, phone, training_id)
+      values (${run.agent_id}, ${agent!.company_id}, ${`test:${runId}:${idx}`}, true, ${p.nome}, '5500000000000', ${run.training_id ?? null})
       on conflict (agent_id, simulation, external_id) do update set contact_name = excluded.contact_name
       returning id`;
     const conversationId = conv!.id;
@@ -451,10 +457,10 @@ export function parseCompare(raw: unknown, turns: { lead: string; original: stri
 
 async function judgeReplay(run: RunRow, spec: AgentSpec, turns: { lead: string; original: string; agent: string }[], conversationId: string) {
   const leadText = turns.map((x) => x.lead).join("\n");
-  const kb = await searchKnowledge({ agentId: run.agent_id, query: leadText.slice(0, 2000), k: 6 }).catch(() => ({ results: [] }));
+  const kb = await searchKnowledge({ agentId: run.agent_id, query: leadText.slice(0, 2000), k: 6, trainingId: run.training_id }).catch(() => ({ results: [] }));
   const ins = spec.instructions;
   const r = await chat({
-    model: config().DEFAULT_MODEL,
+    ...judgeModel(run, config().DEFAULT_MODEL),
     keys: await agentKeys(run.agent_id),
     json: true,
     effort: "low",
@@ -552,7 +558,7 @@ export async function finishIfDone(runId: string) {
     const done = convs.filter((c) => c.verdict);
     if (done.length) {
       const r = await chat({
-        model: config().UTILITY_MODEL,
+        ...judgeModel(run, config().UTILITY_MODEL),
         keys: await agentKeys(run.agent_id),
         json: true,
         effort: "low",

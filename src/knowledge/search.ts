@@ -23,6 +23,8 @@ export async function searchKnowledge(opts: {
   k: number;
   kinds?: string[] | null;
   rerank?: boolean;
+  /** Conversa de um treino: vê os itens em teste dele e não vê os que ele escondeu. */
+  trainingId?: string | null;
 }): Promise<{ results: Retrieved[]; usage: Usage }> {
   const query = opts.query.trim().slice(0, 4000);
   if (!query || opts.k <= 0) return { results: [], usage: emptyUsage() };
@@ -32,7 +34,7 @@ export async function searchKnowledge(opts: {
   const pool = opts.rerank ? Math.min(opts.k * 3, 30) : opts.k;
   const rows = await db()<Retrieved[]>`
     select * from public.kb_search(${opts.agentId}, ${toVector(e.vectors[0]!)}::extensions.vector, ${query}, ${pool},
-                                   ${opts.kinds?.length ? opts.kinds : null})`;
+                                   ${opts.kinds?.length ? opts.kinds : null}, ${opts.trainingId ?? null})`;
   if (!opts.rerank || rows.length <= opts.k) return { results: rows.slice(0, opts.k), usage };
   const r = await rerank(query, rows, opts.k);
   return { results: r.results, usage: addUsage(usage, r.usage) };

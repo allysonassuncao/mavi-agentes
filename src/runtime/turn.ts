@@ -77,6 +77,8 @@ export type ConversationRow = {
   facts: Record<string, unknown>;
   api_context: StartContext | null;
   last_reply_at?: Date | null;
+  /** Conversa de um treino automático (vê a base em teste dele). */
+  training_id?: string | null;
 };
 
 type MessageRow = {
@@ -263,7 +265,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
       const lastAssistant = [...history].reverse().find((h) => h.role === "assistant")?.content ?? "";
       // Mensagem curta ("e o preço?") precisa do assunto anterior para a busca.
       const query = searchText.length < 60 && lastAssistant ? `${lastAssistant.slice(-300)}\n${searchText}` : searchText;
-      const r = await searchKnowledge({ agentId: conv.agent_id, query, k: spec.knowledge.prefetch_k, rerank: spec.knowledge.rerank });
+      const r = await searchKnowledge({ agentId: conv.agent_id, query, k: spec.knowledge.prefetch_k, rerank: spec.knowledge.rerank, trainingId: conv.training_id });
       usage = addUsage(usage, r.usage);
       await cost("retrieval", r.usage, { meta: { via: "prefetch" } });
       prefetch = r.results;
@@ -381,7 +383,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
           }
           case "buscar_conhecimento": {
             const kinds = typeof args.tipo === "string" ? [args.tipo] : null;
-            const r = await searchKnowledge({ agentId: conv.agent_id, query: String(args.consulta ?? ""), k: 6, kinds, rerank: spec.knowledge.rerank });
+            const r = await searchKnowledge({ agentId: conv.agent_id, query: String(args.consulta ?? ""), k: 6, kinds, rerank: spec.knowledge.rerank, trainingId: conv.training_id });
             usage = addUsage(usage, r.usage);
             await cost("retrieval", r.usage, { meta: { via: "tool" } });
             result = formatResults(reg, r.results);
