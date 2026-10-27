@@ -15,6 +15,7 @@ import type { TeamNotifyConfig } from "../spec/integrations.js";
 import type { WeeklyHours } from "../spec/weekly-hours.js";
 import { cleanText, typingDelayMs } from "./output.js";
 import { buildSystemPrompt, contextBlock } from "./prompt.js";
+import { currentStage } from "./stages.js";
 import { integrationCtx, publishedSpec, type ConversationRow } from "./turn.js";
 import { currentTrack, trackSteps } from "./followup-track.js";
 
@@ -230,7 +231,7 @@ export async function writeFollowupAi(
       pricing: spec.model.pricing,
       maxTokens: 600,
       messages: [
-        { role: "system", content: buildSystemPrompt(spec) },
+        { role: "system", content: buildSystemPrompt(spec, (await currentStage(spec, conv, { allowRestart: false })).stage) },
         ...history,
         {
           role: "user",

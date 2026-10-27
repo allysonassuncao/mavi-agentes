@@ -15,6 +15,7 @@ import type { TeamNotifyConfig } from "../spec/integrations.js";
 import { nextOpening } from "./followup.js";
 import { cleanText, typingDelayMs } from "./output.js";
 import { buildSystemPrompt, contextBlock } from "./prompt.js";
+import { currentStage } from "./stages.js";
 import { integrationCtx, meetingLine, publishedSpec, type ConversationRow } from "./turn.js";
 
 /**
@@ -187,7 +188,7 @@ export async function processReminder(meetingId: string, stepId: string, startsA
           pricing: spec.model.pricing,
           maxTokens: 600,
           messages: [
-            { role: "system", content: buildSystemPrompt(spec) },
+            { role: "system", content: buildSystemPrompt(spec, (await currentStage(spec, conv, { allowRestart: false })).stage) },
             ...history,
             {
               role: "user",

@@ -139,9 +139,24 @@ const fold = (v: unknown) =>
 export type InputProblem = { id: string; label: string; problem: "missing" | "invalid"; why?: string };
 export type ActionContact = { phone: string | null; contactName: string | null; facts: Record<string, unknown> };
 
+/** hoje, hora_agora e protocolo (ver BUILTIN_VARS). */
+export function builtinVars(now = new Date()): [string, Value][] {
+  const p = Object.fromEntries(
+    new Intl.DateTimeFormat("pt-BR", { timeZone: "America/Sao_Paulo", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" })
+      .formatToParts(now)
+      .map((x) => [x.type, x.value]),
+  );
+  const rand = String(Math.floor(Math.random() * 10_000)).padStart(4, "0");
+  return [
+    ["hoje", `${p.day}/${p.month}/${p.year}`],
+    ["hora_agora", `${p.hour}:${p.minute}`],
+    ["protocolo", `${String(p.year).slice(2)}${p.month}${p.day}${rand}`],
+  ];
+}
+
 /** Lê e valida os dados (do agente ou do contato). Os que faltam ou não valem vêm em `problems`. */
 export function readInputs(action: ActionT, args: Record<string, unknown>, contact: ActionContact, now = new Date()): { env: Env; problems: InputProblem[] } {
-  const env: Env = new Map();
+  const env: Env = new Map(builtinVars(now));
   const problems: InputProblem[] = [];
   for (const i of action.inputs) {
     let raw: unknown =
@@ -373,7 +388,7 @@ export function runActionTool(spec: AgentSpec, name: string, args: Record<string
     result:
       (r.status === "stopped" ? `"${action.name}" parou: ${r.message}` : `Resultado de "${action.name}": ${r.message}`) +
       `${how}\nValores: ${JSON.stringify(shown).slice(0, 1500)}\nUse o resultado como veio; não refaça a conta.`,
-    debug: { outcome: "ok", summary: r.message.slice(0, 500), details: r.trace.slice(0, 40) },
+    debug: { outcome: "ok", ...(r.status === "stopped" ? { code: "action_stopped" } : {}), summary: r.message.slice(0, 500), details: r.trace.slice(0, 40) },
     facts: r.facts,
   };
 }

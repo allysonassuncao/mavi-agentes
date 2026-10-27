@@ -90,6 +90,12 @@ export function templateVars(template: string): { name: string; format: string |
 /** Os nomes que um dado gera (a data também dá a idade em anos e o dia da semana, ex.: "sábado"). */
 export const inputVars = (i: { id: string; type: ActionInputType }) => (i.type === "date" ? [i.id, `${i.id}_idade`, `${i.id}_dia_semana`] : [i.id]);
 
+/**
+ * Dados que toda ação já tem, sem pedir: a data e a hora de agora (Brasília) e
+ * um número de protocolo novo a cada vez (AAMMDD + 4 dígitos).
+ */
+export const BUILTIN_VARS = ["hoje", "hora_agora", "protocolo"] as const;
+
 const operandVar = (o: OperandT | null) => (o && "var" in o ? o.var : null);
 
 export const Action = z
@@ -121,7 +127,8 @@ export const Action = z
       if (ids.has(i.id)) ctx.addIssue({ code: "custom", message: "Dois dados com o mesmo código.", path: ["inputs", idx, "id"] });
       for (const v of inputVars(i)) ids.add(v);
     });
-    const known = new Set(ids);
+    const known = new Set([...ids, ...BUILTIN_VARS]);
+    for (const b of BUILTIN_VARS) ids.add(b);
     let total = 0;
     // Percorre na ordem: um bloco só usa o que veio antes (dados ou contas de blocos anteriores).
     const walk = (steps: ActionStep[], path: (string | number)[], depth: number) => {

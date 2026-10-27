@@ -1,4 +1,5 @@
 import type { AgentSpec } from "../spec/agent.js";
+import type { StageT } from "../spec/stages.js";
 import type { WeeklyHours } from "../spec/weekly-hours.js";
 import { callbacksPrompt, integrationsPrompt, scenarioPrompt, teamPromptRules } from "../integrations/prompt.js";
 
@@ -44,7 +45,11 @@ const EMOJI = {
 
 const bullets = (items: string[]) => items.map((i) => `- ${i}`).join("\n");
 
-export function buildSystemPrompt(spec: AgentSpec): string {
+/**
+ * `stage`: a etapa da conversa nesta vez (aba Etapas). O prompt muda só quando
+ * a etapa muda, então cada etapa continua aproveitando o cache do provedor.
+ */
+export function buildSystemPrompt(spec: AgentSpec, stage: StageT | null = null): string {
   const { persona: p, instructions: ins } = spec;
   const parts: string[] = [];
 
@@ -55,7 +60,16 @@ export function buildSystemPrompt(spec: AgentSpec): string {
   );
   if (p.company_summary.trim()) parts.push(`# Sobre a empresa\n${p.company_summary.trim()}`);
   parts.push(`# Seu objetivo\n${ins.goal.trim()}`);
-  if (ins.conversation_guide.trim()) parts.push(`# Como conduzir a conversa\n${ins.conversation_guide.trim()}`);
+  if (ins.conversation_guide.trim() && !stage?.hide_guide) parts.push(`# Como conduzir a conversa\n${ins.conversation_guide.trim()}`);
+  if (stage) {
+    const others = spec.stages.items.filter((s) => s.enabled && s.id !== stage.id).map((s) => s.name);
+    parts.push(
+      `# Etapa atual da conversa: ${stage.name}\n` +
+        "O sistema definiu a etapa pelo que já aconteceu na conversa (não pergunte ao lead). " +
+        (others.length ? `As instruções das outras etapas (${others.join(", ")}) não valem agora: se uma regra citar algo que não está aqui, não se aplica nesta etapa.` : "") +
+        (stage.instructions.trim() ? `\n\n${stage.instructions.trim()}` : ""),
+    );
+  }
   if (ins.rules.length) parts.push(`# Regras\n${bullets(ins.rules)}`);
   const hours = [weeklyHoursText(ins.weekly_hours), ins.business_hours.trim()].filter(Boolean).join("\n");
   if (hours) parts.push(`# Horários de funcionamento\n${hours}`);
@@ -208,7 +222,8 @@ export function contextBlock(input: {
   // O nome do perfil do WhatsApp não foi dito pelo lead: o agente decide pelas regras da empresa se usa.
   const who = [input.contactName && `nome no perfil do WhatsApp (o lead não disse): ${input.contactName}`, input.phone && `telefone: ${input.phone}`].filter(Boolean);
   if (who.length) lines.push(`Contato: ${who.join(", ")}`);
-  const facts = Object.entries(input.facts).filter(([, v]) => v !== null && v !== "");
+  // Dados com "_" no começo são do sistema (ex.: desde quando vale a etapa).
+  const facts = Object.entries(input.facts).filter(([k, v]) => !k.startsWith("_") && v !== null && v !== "");
   if (facts.length) lines.push(`Dados já registrados do contato: ${facts.map(([k, v]) => `${k}: ${String(v)}`).join("; ")}`);
   if (input.meeting) lines.push(`Reunião marcada com este lead: ${input.meeting}`);
   if (input.callback) lines.push(`Retorno combinado com este lead: ${input.callback}`);

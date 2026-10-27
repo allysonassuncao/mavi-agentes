@@ -25,6 +25,8 @@ import { runSiteTool, SITE_TOOLS, siteChannel } from "../webchat/agent.js";
 import { CALLBACK_TOOLS, callbackLine, callbacksOn, callbackTools, pendingCallback, runCallbackTool, turnOffAi, type CallbackHit } from "./callbacks.js";
 import { actionTools, isActionTool, runActionTool } from "./actions.js";
 import { pendingTeamLine, runTeamTool, teamOn, teamTool } from "./team.js";
+import { currentStage } from "./stages.js";
+import { checkReply, correctionNote, type GuardViolation } from "./guard.js";
 import { TEAM_TOOL } from "../spec/team.js";
 import { startFollowup } from "./followup-track.js";
 
@@ -284,8 +286,11 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
       return null;
     });
 
+    // 3d. Etapa da conversa (aba Etapas): decidida sem IA, antes do prompt
+    const { stage, restarted: stageRestarted } = await currentStage(spec, conv);
+
     // 4. Mensagens para o LLM
-    const messages: ChatMessage[] = [{ role: "system", content: buildSystemPrompt(spec) }];
+    const messages: ChatMessage[] = [{ role: "system", content: buildSystemPrompt(spec, stage) }];
     for (const h of history) {
       // Mídia de antes do gatilho não é lida (não gasta com quem não ativou o agente).
       if (h.role === "user") messages.push({ role: "user", content: withReferral(h.content || `(${h.content_type} sem texto)`, h.media) });
@@ -334,10 +339,17 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
     let gaps: GapDraft[] = [];
     let rounds = 0;
     let usedModel = model;
+    // Conferência da resposta: cada tentativa barrada fica no rastro.
+    let maxRounds = MAX_ROUNDS;
+    let replyCallId: string | null = null;
+    let lastViolations: GuardViolation[] = [];
+    const guardLog: { attempt: number; violations: GuardViolation[]; messages: ReplyMessage[] }[] = [];
+    const guardSources = () =>
+      [...history.map((h) => h.content), pendingText, event?.text ?? "", conv.summary, ...retrievedForPrompt.map((r) => r.content)].join("\n");
 
-    while (rounds < MAX_ROUNDS && reply === null) {
+    while (rounds < maxRounds && reply === null) {
       rounds++;
-      const last = rounds === MAX_ROUNDS;
+      const last = rounds === maxRounds;
       const res = await chatWithFallback(
         {
           model,
@@ -360,110 +372,144 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
       if (!calls.length) {
         // Provedor que ignorou "required": o texto vira a resposta.
         reply = splitPlainText(res.message.content ?? "", spec);
-        break;
+        replyCallId = null;
+        messages.push({ role: "assistant", content: res.message.content ?? "" });
+      } else {
+        messages.push({ role: "assistant", content: res.message.content ?? null, tool_calls: calls });
+        for (const call of calls) {
+          const started = Date.now();
+          let args: Record<string, unknown> = {};
+          try {
+            args = JSON.parse(call.function.arguments || "{}") as Record<string, unknown>;
+          } catch {
+            args = {};
+          }
+          let result: string;
+          let debug: ActionDebug | undefined;
+          switch (call.function.name) {
+            case REPLY_TOOL: {
+              replyCallId = call.id;
+              reply = normalizeReply(args.mensagens, spec);
+              if (!reply.length) silentReason = typeof args.motivo_silencio === "string" ? args.motivo_silencio : "sem motivo";
+              gaps = parseGaps(args.lacunas);
+              result = "ok";
+              break;
+            }
+            case "buscar_conhecimento": {
+              const kinds = typeof args.tipo === "string" ? [args.tipo] : null;
+              const r = await searchKnowledge({ agentId: conv.agent_id, query: String(args.consulta ?? ""), k: 6, kinds, rerank: spec.knowledge.rerank, trainingId: conv.training_id });
+              usage = addUsage(usage, r.usage);
+              await cost("retrieval", r.usage, { meta: { via: "tool" } });
+              result = formatResults(reg, r.results);
+              for (const x of r.results) retrievedLog.push({ ref: reg.add(x), chunk_id: x.chunk_id, kind: x.kind, title: x.title, score: x.score, via: "tool" });
+              break;
+            }
+            case "registrar_dados_do_contato": {
+              const dados = args.dados && typeof args.dados === "object" ? (args.dados as Record<string, unknown>) : {};
+              const clean = Object.fromEntries(
+                Object.entries(dados)
+                  .filter(([, v]) => v != null && String(v).trim())
+                  .slice(0, 30)
+                  .map(([k, v]) => [k.slice(0, 60), String(v).slice(0, 500)]),
+              );
+              conv.facts = { ...conv.facts, ...clean };
+              await sql`update public.conversations set facts = facts || ${sql.json(clean as never)} where id = ${conv.id}`;
+              result = "Dados registrados.";
+              break;
+            }
+            case "transferir_para_humano": {
+              handoff = String(args.motivo ?? "").slice(0, 500) || "pedido de atendimento humano";
+              debug = { outcome: conv.simulation ? "simulated" : "ok", summary: `Passou para a equipe: ${handoff}` };
+              result = "Transferência registrada. Agora avise o lead pela ferramenta responder.";
+              break;
+            }
+            case SCENARIO_TOOL: {
+              const r = await runScenario(spec, args, ictx);
+              scenario ??= r.hit;
+              result = r.result;
+              debug = r.debug;
+              break;
+            }
+            default:
+              if (CALLBACK_TOOLS.has(call.function.name)) {
+                const r = await runCallbackTool(call.function.name, args, ictx, turnId);
+                result = r.result;
+                debug = r.debug;
+                if (r.hit) callbackHits.push(r.hit);
+              } else if (site && SITE_TOOLS.has(call.function.name)) {
+                const r = await runSiteTool(site, call.function.name, args);
+                result = r.result;
+                debug = r.debug;
+              } else if (isActionTool(call.function.name)) {
+                const r = runActionTool(spec, call.function.name, args, ictx);
+                result = r.result;
+                debug = r.debug;
+                // Dados validados e contas marcadas para guardar: não pergunta de novo.
+                if (Object.keys(r.facts).length) {
+                  conv.facts = { ...conv.facts, ...r.facts };
+                  ictx.facts = conv.facts;
+                  await sql`update public.conversations set facts = facts || ${sql.json(r.facts as never)} where id = ${conv.id}`;
+                }
+              } else if (call.function.name === TEAM_TOOL && teamOn(spec)) {
+                const r = await runTeamTool(args, ictx, turnId);
+                result = r.result;
+                debug = r.debug;
+              } else if (isApiTool(call.function.name)) {
+                const r = await runApiTool(call.function.name, args, ictx);
+                result = r.result;
+                debug = r.debug;
+                // Mídias da resposta (ex.: fotos do carro) ganham código como as do conhecimento.
+                if (r.media?.length) result += `\nMídias desta resposta (para enviar, ponha o código em midias): ${registerApiMedia(reg, r.media).join(", ")}`;
+                if (r.failure) await recordFailure(call.function.name, r.failure, ictx).catch((e) => log.warn({ err: String(e) }, "turn: falha da API não registrada"));
+              } else if (INTEGRATION_TOOL_NAMES.has(call.function.name)) {
+                const r = await runIntegrationTool(call.function.name, args, ictx);
+                result = r.result;
+                debug = r.debug;
+              } else result = "Ferramenta não disponível.";
+          }
+          toolLog.push({
+            name: call.function.name,
+            args: call.function.name === REPLY_TOOL ? undefined : args,
+            result: result.slice(0, 2000),
+            ms: Date.now() - started,
+            ...(debug ? { debug } : {}),
+          });
+          if (call.function.name !== REPLY_TOOL) messages.push({ role: "tool", tool_call_id: call.id, content: result });
+        }
       }
-      messages.push({ role: "assistant", content: res.message.content ?? null, tool_calls: calls });
-      for (const call of calls) {
-        const started = Date.now();
-        let args: Record<string, unknown> = {};
-        try {
-          args = JSON.parse(call.function.arguments || "{}") as Record<string, unknown>;
-        } catch {
-          args = {};
-        }
-        let result: string;
-        let debug: ActionDebug | undefined;
-        switch (call.function.name) {
-          case REPLY_TOOL: {
-            reply = normalizeReply(args.mensagens, spec);
-            if (!reply.length) silentReason = typeof args.motivo_silencio === "string" ? args.motivo_silencio : "sem motivo";
-            gaps = parseGaps(args.lacunas);
-            result = "ok";
-            break;
-          }
-          case "buscar_conhecimento": {
-            const kinds = typeof args.tipo === "string" ? [args.tipo] : null;
-            const r = await searchKnowledge({ agentId: conv.agent_id, query: String(args.consulta ?? ""), k: 6, kinds, rerank: spec.knowledge.rerank, trainingId: conv.training_id });
-            usage = addUsage(usage, r.usage);
-            await cost("retrieval", r.usage, { meta: { via: "tool" } });
-            result = formatResults(reg, r.results);
-            for (const x of r.results) retrievedLog.push({ ref: reg.add(x), chunk_id: x.chunk_id, kind: x.kind, title: x.title, score: x.score, via: "tool" });
-            break;
-          }
-          case "registrar_dados_do_contato": {
-            const dados = args.dados && typeof args.dados === "object" ? (args.dados as Record<string, unknown>) : {};
-            const clean = Object.fromEntries(
-              Object.entries(dados)
-                .filter(([, v]) => v != null && String(v).trim())
-                .slice(0, 30)
-                .map(([k, v]) => [k.slice(0, 60), String(v).slice(0, 500)]),
-            );
-            conv.facts = { ...conv.facts, ...clean };
-            await sql`update public.conversations set facts = facts || ${sql.json(clean as never)} where id = ${conv.id}`;
-            result = "Dados registrados.";
-            break;
-          }
-          case "transferir_para_humano": {
-            handoff = String(args.motivo ?? "").slice(0, 500) || "pedido de atendimento humano";
-            debug = { outcome: conv.simulation ? "simulated" : "ok", summary: `Passou para a equipe: ${handoff}` };
-            result = "Transferência registrada. Agora avise o lead pela ferramenta responder.";
-            break;
-          }
-          case SCENARIO_TOOL: {
-            const r = await runScenario(spec, args, ictx);
-            scenario ??= r.hit;
-            result = r.result;
-            debug = r.debug;
-            break;
-          }
-          default:
-            if (CALLBACK_TOOLS.has(call.function.name)) {
-              const r = await runCallbackTool(call.function.name, args, ictx, turnId);
-              result = r.result;
-              debug = r.debug;
-              if (r.hit) callbackHits.push(r.hit);
-            } else if (site && SITE_TOOLS.has(call.function.name)) {
-              const r = await runSiteTool(site, call.function.name, args);
-              result = r.result;
-              debug = r.debug;
-            } else if (isActionTool(call.function.name)) {
-              const r = runActionTool(spec, call.function.name, args, ictx);
-              result = r.result;
-              debug = r.debug;
-              // Dados validados e contas marcadas para guardar: não pergunta de novo.
-              if (Object.keys(r.facts).length) {
-                conv.facts = { ...conv.facts, ...r.facts };
-                ictx.facts = conv.facts;
-                await sql`update public.conversations set facts = facts || ${sql.json(r.facts as never)} where id = ${conv.id}`;
-              }
-            } else if (call.function.name === TEAM_TOOL && teamOn(spec)) {
-              const r = await runTeamTool(args, ictx, turnId);
-              result = r.result;
-              debug = r.debug;
-            } else if (isApiTool(call.function.name)) {
-              const r = await runApiTool(call.function.name, args, ictx);
-              result = r.result;
-              debug = r.debug;
-              // Mídias da resposta (ex.: fotos do carro) ganham código como as do conhecimento.
-              if (r.media?.length) result += `\nMídias desta resposta (para enviar, ponha o código em midias): ${registerApiMedia(reg, r.media).join(", ")}`;
-              if (r.failure) await recordFailure(call.function.name, r.failure, ictx).catch((e) => log.warn({ err: String(e) }, "turn: falha da API não registrada"));
-            } else if (INTEGRATION_TOOL_NAMES.has(call.function.name)) {
-              const r = await runIntegrationTool(call.function.name, args, ictx);
-              result = r.result;
-              debug = r.debug;
-            } else result = "Ferramenta não disponível.";
-        }
-        toolLog.push({
-          name: call.function.name,
-          args: call.function.name === REPLY_TOOL ? undefined : args,
-          result: result.slice(0, 2000),
-          ms: Date.now() - started,
-          ...(debug ? { debug } : {}),
+
+      // Conferência: barrou e ainda dá para reescrever → o motivo volta ao agente.
+      if (reply !== null && spec.guard.enabled && (!scenario || scenario.scenario.reply === "agent")) {
+        lastViolations = checkReply(spec, reply, {
+          stageId: stage?.id ?? null,
+          tools: toolLog.map((t) => ({ name: t.name, ok: toolOk(t.debug), result: t.result })),
+          facts: conv.facts,
+          sources: guardSources(),
         });
-        if (call.function.name !== REPLY_TOOL) messages.push({ role: "tool", tool_call_id: call.id, content: result });
+        if (lastViolations.length) {
+          guardLog.push({ attempt: guardLog.length + 1, violations: lastViolations, messages: reply });
+          if (guardLog.length <= spec.guard.retries) {
+            const effects = [...new Set(toolLog.map((t) => t.name).filter((n) => !SAFE_TO_REDO.has(n) && !isActionTool(n) && !(isApiTool(n) && apiOf(spec, n)?.kind !== "write")))];
+            const note = correctionNote(lastViolations, reply, effects);
+            if (replyCallId) messages.push({ role: "tool", tool_call_id: replyCallId, content: note });
+            else messages.push({ role: "user", content: `[Conferência do sistema — não é mensagem do lead] ${note}` });
+            reply = null;
+            silentReason = undefined;
+            maxRounds = Math.max(maxRounds, rounds + 2);
+          }
+        }
       }
     }
     timings.llm = Date.now() - tm;
+    // Continuou errado depois das tentativas: o grave não sai (mensagem de segurança ou silêncio); o leve sai assim.
+    let guardFinal: "ok" | "corrected" | "sent_with_issues" | "blocked" | null = spec.guard.enabled ? (guardLog.length ? "corrected" : "ok") : null;
+    if (reply && lastViolations.length) {
+      if (lastViolations.some((v) => v.severity === "grave")) {
+        guardFinal = "blocked";
+        reply = spec.guard.fallback_message ? splitPlainText(spec.guard.fallback_message, spec) : [];
+        if (!reply.length) silentReason = "conferência: a resposta continuou com problema grave";
+      } else guardFinal = "sent_with_issues";
+    }
     reply ??= [];
     // Cenário com resposta combinada: a mensagem configurada (ou nenhuma) no lugar da do modelo.
     if (scenario?.scenario.reply === "fixed") reply = splitPlainText(scenario.scenario.message, spec);
@@ -591,7 +637,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
         values (${turnId}, ${conv.id}, ${conv.agent_id}, ${version}, ${conv.simulation}, ${status}, ${pending.map((m) => m.id)}::bigint[], ${usedModel}, ${rounds},
                 ${usage.tokensIn}, ${usage.tokensOut}, ${usage.tokensCached}, ${usage.costUsd}, ${tx.json(timings as never)},
                 ${tx.json(toolLog as never)}, ${tx.json(retrievedLog as never)},
-                ${tx.json({ messages: reply, silent_reason: silentReason ?? null, handoff: handoff ?? null, gaps, ...(scenario ? { scenario: { id: scenario.scenario.id, name: scenario.scenario.name, reason: scenario.reason, done: scenario.done } } : {}), ...(interrupted ? { interrupted: true } : {}) } as never)},
+                ${tx.json({ messages: reply, silent_reason: silentReason ?? null, handoff: handoff ?? null, gaps, ...(stage ? { stage: { id: stage.id, name: stage.name, ...(stageRestarted ? { restarted: true } : {}) } } : {}), ...(guardFinal ? { guard: { final: guardFinal, attempts: guardLog } } : {}), ...(scenario ? { scenario: { id: scenario.scenario.id, name: scenario.scenario.name, reason: scenario.reason, done: scenario.done } } : {}), ...(interrupted ? { interrupted: true } : {}) } as never)},
                 ${sendError ? `Envio parcial: ${sendError}`.slice(0, 2000) : null})`;
     });
 
@@ -635,6 +681,9 @@ export async function runTurn(opts: TurnOptions): Promise<TurnResult> {
     return { turnId, status: "error", messages: [], attachments: {}, error };
   }
 }
+
+/** A ferramenta fez o que devia (ação que "parou" não conta: ex.: simulação recusada). */
+const toolOk = (d: ActionDebug | undefined) => (!d || d.outcome === "ok" || d.outcome === "simulated") && d?.code !== "action_stopped";
 
 /** As mídias vindas de uma API entram no registro da vez (M1, M2…) e podem ir junto da resposta. */
 export function registerApiMedia(reg: RefRegistry, media: ApiMedia[]): string[] {

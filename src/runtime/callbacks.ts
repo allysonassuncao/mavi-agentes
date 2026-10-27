@@ -18,6 +18,7 @@ import type { WeeklyHours } from "../spec/weekly-hours.js";
 import { nextOpening } from "./followup.js";
 import { cleanText, typingDelayMs } from "./output.js";
 import { buildSystemPrompt, contextBlock } from "./prompt.js";
+import { currentStage } from "./stages.js";
 import { startFollowup } from "./followup-track.js";
 import { integrationCtx, meetingLine, publishedSpec, type ConversationRow } from "./turn.js";
 
@@ -480,7 +481,7 @@ export async function processCallback(callbackId: string): Promise<string> {
               pricing: spec.model.pricing,
               maxTokens: 600,
               messages: [
-                { role: "system", content: buildSystemPrompt(spec) },
+                { role: "system", content: buildSystemPrompt(spec, (await currentStage(spec, conv, { allowRestart: false })).stage) },
                 ...history,
                 {
                   role: "user",

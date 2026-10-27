@@ -42,6 +42,8 @@ import { Callbacks } from "./callbacks.js";
 import { ExternalApis } from "./apis.js";
 import { Actions } from "./actions.js";
 import { TeamQuestions } from "./team.js";
+import { Stages } from "./stages.js";
+import { Guard } from "./guard.js";
 
 export const Instructions = z
   .object({
@@ -195,6 +197,10 @@ export const AgentSpec = z
     actions: Actions,
     /** Consulta à equipe: dúvida que o agente não sabe vai para a equipe e ele espera a resposta. */
     team_questions: TeamQuestions.nullable().default(null),
+    /** Etapas da conversa: instruções que valem só numa etapa (decidida sem IA, pelo que já aconteceu). */
+    stages: Stages.default(Stages.parse({})),
+    /** Conferência da resposta: regras em código antes de enviar (barrou, o agente reescreve). */
+    guard: Guard.default(Guard.parse({})),
     tools: z.array(ToolRef).max(40).default([]),
     automations: z.array(z.record(z.string(), z.unknown())).max(40).default([]),
   })
