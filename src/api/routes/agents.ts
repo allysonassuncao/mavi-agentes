@@ -362,7 +362,12 @@ export async function agentRoutes(app: FastifyInstance) {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const f = cleanFilters(body);
     if (!f) throw new HttpError(400, "Período inválido.");
-    const ids = await conversationIds(companyId, f);
+    let ids = await conversationIds(companyId, f);
+    // Só estas conversas (as escolhidas na lista), dentro dos mesmos filtros (a empresa e o período continuam valendo).
+    if (Array.isArray(body.conversation_ids)) {
+      const pick = new Set(body.conversation_ids.map(String).slice(0, 200));
+      ids = ids.filter((x) => pick.has(x));
+    }
     if (body.count_only === true) return { total: ids.length };
     const offset = Math.max(0, Number.parseInt(String(body.cursor ?? "0"), 10) || 0);
     const limit = Math.min(Math.max(Number(body.limit) || 30, 1), 50);

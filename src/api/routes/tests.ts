@@ -109,8 +109,10 @@ export async function testRoutes(app: FastifyInstance) {
     // As conversas prontas (reais, casos) podem faltar: o que faltar para "conversations" vira lead simulado.
     if (body.kind === "training" && (!body.training_id || body.spec === undefined))
       throw new HttpError(400, "O treino manda a cópia do rascunho e o id do treino.");
+    // Leads simulados também mandam leads prontos (conversa real reencenada ou lead parecido com um real);
+    // o que faltar para "conversations" vira lead simulado.
     const personas: unknown[] =
-      body.kind === "training"
+      body.kind === "training" || body.kind === "manual"
         ? body.personas
         : body.kind === "replay"
         ? body.scripts.map((x) => ({
@@ -128,9 +130,9 @@ export async function testRoutes(app: FastifyInstance) {
         : [];
     const insert = async (use: "draft" | "published" | number, compareTo: string | null) => {
       const s = await specOf(use);
-      const conversations = body.kind === "training" ? Math.max(personas.length, body.conversations) : personas.length || body.conversations;
+      const conversations = body.kind === "training" || body.kind === "manual" ? Math.max(personas.length, body.conversations) : personas.length || body.conversations;
       const scripted = personas.map((x) => ((x as { script?: unknown[] }).script ?? []).length);
-      const maxTurns = body.kind === "replay" ? Math.min(20, Math.max(2, ...scripted)) : body.kind === "training" ? Math.min(20, Math.max(body.max_turns, ...scripted)) : body.max_turns;
+      const maxTurns = body.kind === "replay" ? Math.min(20, Math.max(2, ...scripted)) : body.kind === "training" || body.kind === "manual" ? Math.min(20, Math.max(body.max_turns, ...scripted)) : body.max_turns;
       const [row] = await sql<{ id: string }[]>`
         insert into public.test_runs (agent_id, kind, agent_version, spec, compare_to, profiles, focus, personas, conversations, max_turns, cost_cap_usd, created_by,
                                       training_id, models)
